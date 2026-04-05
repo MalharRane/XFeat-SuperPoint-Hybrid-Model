@@ -1,0 +1,77 @@
+# config.yaml
+# ============================================================================
+# XFeat-SuperPoint Hybrid Model — Training Configuration
+# ============================================================================
+#
+# Usage:
+#   python train.py --config config.yaml
+#
+# All values here are defaults. Override any via CLI arguments:
+#   python train.py --config config.yaml --lr 1e-4 --batch_size 8
+# ============================================================================
+
+
+# ---------------------------------------------------------------------------
+# Training mode
+# ---------------------------------------------------------------------------
+mode: synthetic          # 'synthetic' | 'megadepth'
+                         # synthetic  → random homographic warps (pre-training)
+                         # megadepth  → real scene pairs (fine-tuning)
+
+# ---------------------------------------------------------------------------
+# Data paths
+# ---------------------------------------------------------------------------
+data_root: ./data/images  # synthetic: directory of raw images
+                           # megadepth: path to MegaDepth root directory
+
+scene_info_dir: null       # megadepth only: path to scene_info/ .npz files
+                           # null → data_root/scene_info (default)
+
+# ---------------------------------------------------------------------------
+# Image configuration
+# ---------------------------------------------------------------------------
+image_height: 480          # H — must be divisible by 8
+image_width:  640          # W — must be divisible by 8
+
+# ---------------------------------------------------------------------------
+# Model hyperparameters
+# ---------------------------------------------------------------------------
+num_keypoints:  2048       # Maximum keypoints extracted per image
+nms_radius:     4          # NMS window half-radius (pixels)
+descriptor_dim: 256        # SuperPoint descriptor dimensionality (fixed)
+
+# ---------------------------------------------------------------------------
+# Loss function (SuperPoint §3.4)
+# ---------------------------------------------------------------------------
+positive_margin:          1.0    # mp: target cosine-sim for matching pairs
+negative_margin:          0.2    # mn: max allowed cosine-sim for non-matches
+lambda_d:                 250.0  # λd: weighting for positive pairs
+correspondence_threshold: 8.0    # τ: pixel distance threshold for pos labels
+
+# ---------------------------------------------------------------------------
+# Optimisation
+# ---------------------------------------------------------------------------
+batch_size:       4          # Pairs per batch (reduce if OOM)
+num_workers:      4          # DataLoader workers (set 0 for debug)
+max_epochs:       50
+lr:               3.0e-4     # Initial Adam learning rate
+weight_decay:     1.0e-4     # L2 regularisation
+lr_decay_factor:  0.5        # Multiply LR by this at each milestone
+lr_decay_epochs:  [20, 35, 45]
+grad_clip_norm:   10.0       # Max gradient norm (important with large λd)
+mixed_precision:  true       # AMP (disable on CPU or old CUDA)
+
+# ---------------------------------------------------------------------------
+# Data filters (megadepth mode only)
+# ---------------------------------------------------------------------------
+min_overlap: 0.15            # Min covisibility score for a valid pair
+max_overlap: 0.70            # Max covisibility (trivial pairs excluded)
+augment:     true            # Photometric augmentation on image2
+
+# ---------------------------------------------------------------------------
+# Checkpointing & logging
+# ---------------------------------------------------------------------------
+checkpoint_dir: checkpoints  # Where to save .pth files
+log_dir:        runs         # TensorBoard log directory
+save_every:     5            # Save checkpoint every N epochs
+val_every:      1            # Run validation every N epochs

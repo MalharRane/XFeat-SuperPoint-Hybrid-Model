@@ -1,0 +1,29 @@
+# XFeat-SuperPoint Hybrid Model — Python dependencies
+# Install with:  pip install -r requirements.txt
+
+# Core deep learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Image I/O and processing
+Pillow>=9.0.0
+opencv-python-headless>=4.7.0
+
+# Scientific computing
+numpy>=1.23.0
+scipy>=1.9.0
+
+# Data loading
+h5py>=3.7.0            # MegaDepth depth files
+
+# Training utilities
+tensorboard>=2.12.0    # Logging
+pyyaml>=6.0            # Config parsing
+tqdm>=4.65.0           # Progress bars
+
+# Optional: faster data loading
+# albumentations>=1.3.0
+
+# Evaluation (optional)
+# kornia>=0.6.10       # Geometric vision utilities
+# pycolmap>=0.4.0      # RANSAC / pose estimation
