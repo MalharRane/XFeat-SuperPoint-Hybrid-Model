@@ -138,6 +138,45 @@ class HybridModel(nn.Module):
         if self._xfeat_kp_hook_handle is not None:
             self._xfeat_kp_hook_handle.remove()
         self._xfeat_kp_hook_handle = head.register_forward_hook(_hook)
+
+    def unfreeze_xfeat_modules(self, name_keywords: Tuple[str, ...]) -> int:
+        """
+        Unfreeze additional XFeat parameters by name keyword match.
+
+        Args
+        ----
+        name_keywords : tuple[str, ...]
+            Lower/upper-case-insensitive substrings matched against
+            ``self.xfeat.named_parameters()`` names.
+
+        Returns
+        -------
+        int
+            Number of newly-unfrozen parameters (counted by elements).
+        """
+        keywords = tuple(k.strip().lower() for k in name_keywords if k and k.strip())
+        if not keywords:
+            return 0
+
+        newly_unfrozen = 0
+        matched_names = 0
+        for name, p in self.xfeat.named_parameters():
+            lname = name.lower()
+            if any(k in lname for k in keywords):
+                matched_names += 1
+                if not p.requires_grad:
+                    p.requires_grad_(True)
+                    newly_unfrozen += p.numel()
+
+        trainable = _count_params(self.xfeat, trainable_only=True)
+        total = _count_params(self.xfeat)
+        print(
+            "[HybridModel] Scheduled unfreeze "
+            f"keywords={keywords} matched={matched_names} "
+            f"new={newly_unfrozen:,} params; "
+            f"trainable now {trainable:,}/{total:,} ({100 * trainable / max(total,1):.1f}%)"
+        )
+        return newly_unfrozen
         print(f"[HybridModel] XFeat kp-head hook installed on {head.__class__.__name__}")
 
     # ------------------------------------------------------------------

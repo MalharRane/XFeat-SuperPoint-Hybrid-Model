@@ -60,22 +60,44 @@ balance_pos_neg:          true   # normalise positive/negative hinge terms separ
 # ---------------------------------------------------------------------------
 batch_size:       4          # Pairs per batch (reduce if OOM)
 num_workers:      4          # DataLoader workers (set 0 for debug)
-max_epochs:       50
+max_epochs:       80         # Run longer; best often appears late
 lr:               1.0e-4     # Initial Adam learning rate
 weight_decay:     1.0e-4     # L2 regularisation
-lr_patience:      3          # ReduceLROnPlateau patience (epochs without improvement)
+lr_patience:      2          # ReduceLROnPlateau patience (epochs without improvement)
 lr_factor:        0.5        # Multiply LR by this when plateau detected
 min_lr:           1.0e-6     # Minimum learning rate floor
+lr_threshold:     1.0e-4     # Min relative improvement to avoid LR decay
+lr_cooldown:      0          # Cooldown epochs after LR reduction
 grad_clip_norm:   10.0       # Max gradient norm (important with large λd)
 mixed_precision:  true       # AMP (disable on CPU or old CUDA)
-early_stop_patience: 10      # Stop after N epochs without val improvement
+early_stop_patience: 20      # Stop after N epochs without val improvement
+model_selection_metric: loss # 'loss' | 'sim_gap' | 'repeatability'
+val_max_batches: 50          # Validation batches per epoch (increase for stability)
+
+# Optional staged capacity expansion
+unfreeze_at_epoch: null      # e.g. 10 to unfreeze extra XFeat modules after warmup
+unfreeze_keywords: []        # e.g. ['block3', 'block4']
 
 # ---------------------------------------------------------------------------
 # Data filters (megadepth mode only)
 # ---------------------------------------------------------------------------
 min_overlap: 0.15            # Min covisibility score for a valid pair
 max_overlap: 0.70            # Max covisibility (trivial pairs excluded)
+max_pairs_per_scene: 1000    # Increase pair count per scene (more supervision)
 augment:     true            # Photometric augmentation on image2
+
+# ---------------------------------------------------------------------------
+# Optional 2-stage schedule (recommended): synthetic -> megadepth
+# ---------------------------------------------------------------------------
+two_stage: false
+synthetic_data_root: null    # Required when two_stage=true and synthetic data differs
+megadepth_data_root: null    # Required when two_stage=true and MegaDepth root differs
+stage1_epochs: 30
+stage2_epochs: 50
+stage1_checkpoint_subdir: stage1_synthetic
+stage2_checkpoint_subdir: stage2_megadepth
+stage1_log_subdir: stage1_synthetic
+stage2_log_subdir: stage2_megadepth
 
 # ---------------------------------------------------------------------------
 # Checkpointing & logging

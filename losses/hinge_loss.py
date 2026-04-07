@@ -364,6 +364,10 @@ class HomographyHingeLoss(nn.Module):
         with torch.no_grad():
             n_pos_pairs = float(S.sum().item())
             n_neg_pairs = float(N * M) - n_pos_pairs
+            has_match_1 = (S.sum(dim=1) > 0).float()
+            has_match_2 = (S.sum(dim=0) > 0).float()
+            rep1 = has_match_1.mean().item()
+            rep2 = has_match_2.mean().item()
             eps   = 1e-8
             pos_sim_mean = (sim * S).sum().item()         / (n_pos_pairs + eps)
             neg_sim_mean = (sim * (1.0 - S)).sum().item() / (n_neg_pairs + eps)
@@ -385,6 +389,10 @@ class HomographyHingeLoss(nn.Module):
                 'n_neg':         n_neg_pairs,
                 'pos_sim_mean':  pos_sim_mean,
                 'neg_sim_mean':  neg_sim_mean,
+                'sim_gap':       pos_sim_mean - neg_sim_mean,
+                'repeatability_1': rep1,
+                'repeatability_2': rep2,
+                'repeatability_mean': 0.5 * (rep1 + rep2),
                 'pos_ratio':     n_pos_pairs / total_pairs,
             }
 
