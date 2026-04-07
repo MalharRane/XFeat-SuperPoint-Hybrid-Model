@@ -31,13 +31,15 @@ Per-pair hinge loss (extended with score weighting):
   mn = 0.2   negative margin (push non-matches below cosine-sim = 0.2)
   λd = 250   weighting to compensate for the pos/neg imbalance
 
-Gradient Path
---------------
-The score weights W_{ij} are differentiable w.r.t. the XFeat heatmap:
-  ∂L/∂score₁ᵢ = (1/NM) Σⱼ [λd·s_{ij}·relu(mp-sim_{ij}) + (1-s_{ij})·relu(sim_{ij}-mn)] · score₂ⱼ
+Gradient w.r.t. score₁ᵢ
+-------------------------
+  ∂L/∂score₁ᵢ = (1/NM) Σⱼ [λd·s_{ij}·relu(mp-sim_{ij})
+                             + (1-s_{ij})·relu(sim_{ij}-mn)] · score₂ⱼ
 
-This is always ≥ 0, so gradient descent reduces scores at positions with
-poor descriptor matches — teaching XFeat to avoid non-repeatable spots.
+Both relu() terms are non-negative (clamped to 0 when already satisfied)
+and score₂ⱼ ≥ 0 (sigmoid output), so the sum is always ≥ 0.  Gradient
+descent therefore reduces scores wherever descriptor matches are poor,
+teaching XFeat to avoid non-repeatable or ambiguous spots.
 
 Repeatability Reward
 ---------------------
@@ -61,6 +63,10 @@ for real 3D scenes with parallax.
 
 Reference: DeTone et al., "SuperPoint", CVPRW 2018 §3.4
 """
+
+# Minimum positive depth (metres) for a 3-D point to be considered valid.
+# Used both here (border check) and in MegaDepthDataset._compute_warp_field.
+_MIN_DEPTH_Z: float = 0.01
 
 import torch
 import torch.nn as nn
@@ -298,11 +304,11 @@ class HomographyHingeLoss(nn.Module):
 
         # ── Step 3: Score weight matrix (differentiable → kp_head) ────────
         # W[i,j] = score1[i] * score2[j], normalised so mean(W) = 1.
-        # Gradient: ∂L/∂score1[i] = Σⱼ hinge_ij * score2[j] / NM ≥ 0
-        # → gradient descent decreases scores at positions with poor matches.
-        # Combined with the repeatability reward (below) which *increases*
-        # scores at geometrically matched positions, the model learns to
-        # select spots that are both repeatable AND discriminative.
+        # Gradient: ∂L/∂score1[i] = Σⱼ hinge_ij * score2[j] / NM
+        # Both relu() terms and score2[j] are always ≥ 0, so this gradient
+        # is non-negative: gradient descent reduces scores at positions with
+        # poor descriptor matches.  The repeatability reward below provides
+        # the complementary positive signal (raises scores at matched spots).
         if scores1 is not None and scores2 is not None:
             W = scores1.unsqueeze(1) * scores2.unsqueeze(0)  # (N, M)
             W = W / W.mean().clamp(min=1e-8)                 # mean-normalise

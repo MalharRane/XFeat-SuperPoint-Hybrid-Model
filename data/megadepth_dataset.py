@@ -47,6 +47,10 @@ import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 from PIL import Image
 
+# Minimum positive depth for a reprojected point to be considered in front
+# of the camera.  Must match the constant in losses/hinge_loss.py.
+_MIN_DEPTH_Z: float = 0.01
+
 
 # ---------------------------------------------------------------------------
 # Homography generation utilities
@@ -511,7 +515,7 @@ class MegaDepthDataset(Dataset):
 
         # Project onto image-2
         z2 = P_cam2[2]                                         # (H*W,)
-        valid_z = (z2 > 0.01) & (d_flat > 0.0)               # in front of cam-2 and has depth
+        valid_z = (z2 > _MIN_DEPTH_Z) & (d_flat > 0.0)  # in front of cam-2 and has depth
 
         proj = K2.astype(np.float64) @ (P_cam2 / np.where(valid_z, z2, 1.0)[np.newaxis, :])
         x2 = proj[0].astype(np.float32)
