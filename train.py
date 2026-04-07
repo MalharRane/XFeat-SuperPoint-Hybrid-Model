@@ -33,7 +33,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 
 # ---------------------------------------------------------------------------
@@ -259,7 +259,7 @@ def train_step(
 
     optimizer.zero_grad(set_to_none=True)
 
-    with autocast(enabled=cfg.get('mixed_precision', True)):
+    with autocast('cuda', enabled=cfg.get('mixed_precision', True)):
         out1 = model.forward_train(image1)
         out2 = model.forward_train(image2)
 
@@ -439,7 +439,7 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
         patience=cfg.get('lr_patience', 5),
         min_lr=cfg.get('min_lr', 1e-6),
     )
-    scaler = GradScaler(enabled=cfg.get('mixed_precision', True))
+    scaler = GradScaler('cuda', enabled=cfg.get('mixed_precision', True))
 
     # ── Data ────────────────────────────────────────────────────────────
     image_size = (cfg['image_height'], cfg['image_width'])
