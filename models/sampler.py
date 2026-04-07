@@ -179,9 +179,12 @@ class DifferentiableDescriptorSampler(nn.Module):
         #   • grid is computed from keypoints_px, which are derived from
         #     XFeat's heatmap → gradient flows back to XFeat kp head. ✓
         #
+        # AMP note: grid is float32 (keypoints are always cast via .float()).
+        # descriptor_map must also be float32: F.grid_sample requires matching
+        # dtypes and bicubic mode is numerically unstable in float16.
         sampled = F.grid_sample(
-            descriptor_map,           # (1, 256, Hc, Wc)
-            grid,                     # (1, 1,  N,  2)
+            descriptor_map.float(),   # (1, 256, Hc, Wc) — ensure float32
+            grid,                     # (1, 1,  N,  2)   — already float32
             mode=self.mode,           # 'bicubic'
             padding_mode=self.padding_mode,  # 'border'
             align_corners=True,       # consistent with SuperPoint's decoder
