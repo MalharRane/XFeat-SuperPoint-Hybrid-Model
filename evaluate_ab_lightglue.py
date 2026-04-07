@@ -353,6 +353,7 @@ def _evaluate_checkpoint(
                     kp2 = out2["keypoints_px"][0][idx1]
                     inlier_mask = None
                     if kp1.shape[0] >= 4:
+                        # We only need the inlier mask for visualization coloring.
                         _, inlier_mask = cv2.findHomography(
                             kp1.cpu().numpy().astype(np.float32),
                             kp2.cpu().numpy().astype(np.float32),
@@ -372,6 +373,22 @@ def _evaluate_checkpoint(
             seen += 1
 
     return {k: v / max(seen, 1) for k, v in totals.items()}
+
+
+def _build_eval_loader(cfg: Dict, args: argparse.Namespace):
+    return build_dataloader(
+        mode=cfg["mode"],
+        root=cfg["data_root"],
+        image_size=(cfg["image_height"], cfg["image_width"]),
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        shuffle=False,
+        scene_info_dir=cfg.get("scene_info_dir"),
+        min_overlap=cfg["min_overlap"],
+        max_overlap=cfg["max_overlap"],
+        max_pairs_per_scene=cfg.get("max_pairs_per_scene", 1000),
+        augment=False,
+    )
 
 
 def _print_summary(title: str, metrics: Dict[str, float]) -> None:
@@ -413,6 +430,7 @@ def main() -> None:
     parser.add_argument("--mma_thresholds", type=str, default="1,3,5")
     parser.add_argument("--precision_threshold", type=float, default=3.0)
     parser.add_argument("--ransac_threshold", type=float, default=3.0)
+    parser.add_argument("--lightglue_features", type=str, default="superpoint")
     parser.add_argument("--output_dir", type=str, default="benchmarks/ab_lightglue")
     parser.add_argument("--save_vis_count", type=int, default=10)
     args = parser.parse_args()
@@ -435,7 +453,7 @@ def main() -> None:
             "(e.g. pip install lightglue)."
         )
 
-    matcher = LightGlue(features="superpoint").eval().to(device)
+    matcher = LightGlue(features=args.lightglue_features).eval().to(device)
     loss_fn = HomographyHingeLoss(
         positive_margin=cfg["positive_margin"],
         negative_margin=cfg["negative_margin"],
@@ -446,19 +464,7 @@ def main() -> None:
         balance_pos_neg=cfg.get("balance_pos_neg", True),
     )
 
-    val_loader = build_dataloader(
-        mode=cfg["mode"],
-        root=cfg["data_root"],
-        image_size=(cfg["image_height"], cfg["image_width"]),
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        shuffle=False,
-        scene_info_dir=cfg.get("scene_info_dir"),
-        min_overlap=cfg["min_overlap"],
-        max_overlap=cfg["max_overlap"],
-        max_pairs_per_scene=cfg.get("max_pairs_per_scene", 1000),
-        augment=False,
-    )
+    val_loader = _build_eval_loader(cfg, args)
 
     old_model = build_model(cfg, device)
     _load_checkpoint_weights(old_model, args.old_ckpt, device)
@@ -479,19 +485,7 @@ def main() -> None:
 
     # Rebuild loader with same seed to keep pair ordering fixed for new checkpoint.
     _set_seed(args.seed)
-    val_loader = build_dataloader(
-        mode=cfg["mode"],
-        root=cfg["data_root"],
-        image_size=(cfg["image_height"], cfg["image_width"]),
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        shuffle=False,
-        scene_info_dir=cfg.get("scene_info_dir"),
-        min_overlap=cfg["min_overlap"],
-        max_overlap=cfg["max_overlap"],
-        max_pairs_per_scene=cfg.get("max_pairs_per_scene", 1000),
-        augment=False,
-    )
+    val_loader = _build_eval_loader(cfg, args)
 
     new_model = build_model(cfg, device)
     _load_checkpoint_weights(new_model, args.new_ckpt, device)
