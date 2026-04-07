@@ -136,46 +136,61 @@ class HybridModel(nn.Module):
         B, _, _, _ = heatmap.shape
         H, W = image_hw
         score = self._xfeat_logits_to_scoremap(heatmap, image_hw)
+        # score: (B, H, W) — differentiable from heatmap logits ✓
 
         keypoints_list: List[torch.Tensor] = []
         scores_list: List[torch.Tensor] = []
 
         for b in range(B):
-            sm = score[b].clone()
+            # Keep sm in the computation graph — do NOT clone/detach here.
+            sm = score[b]  # (H, W)
 
-            # Border suppression
+            # ── Border suppression (OUT-OF-PLACE to preserve gradient) ──────
+            # In-place zeroing (sm[:m,:] = 0) would break the autograd graph.
             m = self.border_margin
-            sm[:m, :] = 0
-            sm[-m:, :] = 0
-            sm[:, :m] = 0
-            sm[:, -m:] = 0
+            border_mask = sm.new_zeros(H, W)
+            border_mask[m:H - m, m:W - m] = 1.0
+            sm = sm * border_mask  # new tensor, gradient preserved ✓
 
-            # Mild smoothing to reduce checkerboard/grid artifacts
-            sm = F.avg_pool2d(sm[None, None], kernel_size=3, stride=1, padding=1).squeeze()
+            # ── Mild smoothing (creates a new tensor, gradient preserved) ───
+            sm = F.avg_pool2d(
+                sm[None, None], kernel_size=3, stride=1, padding=1
+            ).squeeze()
 
-            # NMS
+            # ── NMS: use DETACHED sm for position selection only ─────────────
+            # We want integer keypoint coordinates (non-differentiable), but
+            # the SCORE VALUES at those positions must remain differentiable.
+            sm_d = sm.detach()
             kernel = 2 * self.nms_radius + 1
-            local_max = F.max_pool2d(sm[None, None], kernel_size=kernel, stride=1, padding=self.nms_radius).squeeze()
-            nms_mask = (sm == local_max)
+            local_max = F.max_pool2d(
+                sm_d[None, None], kernel_size=kernel,
+                stride=1, padding=self.nms_radius,
+            ).squeeze()
+            nms_mask = (sm_d == local_max)  # bool from detached — no grad
 
             r = max(self.nms_radius, self.border_margin)
-            nms_mask[:r, :] = False
+            nms_mask[:r, :]  = False   # in-place on bool tensor — fine ✓
             nms_mask[-r:, :] = False
-            nms_mask[:, :r] = False
+            nms_mask[:,  :r] = False
             nms_mask[:, -r:] = False
 
-            yx = nms_mask.nonzero(as_tuple=False)   # [y,x]
-            s = sm[nms_mask]
+            yx = nms_mask.nonzero(as_tuple=False)   # (K, 2) integer [y, x]
+            # Boolean-mask indexing on sm (not sm_d) — values remain
+            # differentiable w.r.t. heatmap ✓
+            s = sm[nms_mask]                        # (K,)
 
             if yx.shape[0] == 0:
-                flat_idx = sm.flatten().topk(min(self.num_keypoints, sm.numel())).indices
+                flat_idx = sm_d.flatten().topk(
+                    min(self.num_keypoints, sm_d.numel())
+                ).indices
                 yx = torch.stack([flat_idx // W, flat_idx % W], dim=1)
-                s = sm.flatten()[flat_idx]
+                s  = sm.flatten()[flat_idx]          # differentiable ✓
 
             K = min(self.num_keypoints, s.shape[0])
-            top_idx = torch.topk(s, K).indices
-            kp = yx[top_idx].flip(1).float()   # [x,y]
-            sc = s[top_idx]
+            # Detach for index selection; index sm (not sm_d) for values
+            top_idx = s.detach().topk(K).indices     # LongTensor, no grad
+            kp = yx[top_idx].flip(1).float()         # (K, 2) [x, y]
+            sc = s[top_idx]                          # (K,) — differentiable ✓
 
             keypoints_list.append(kp)
             scores_list.append(sc)
@@ -266,7 +281,7 @@ class HybridModel(nn.Module):
             scale = kp_px.new_tensor([W - 1, H - 1])
             kp_norm = kp_px / scale
 
-            descriptors_list.append(sampled_desc.T)   # (256, N)
+            descriptors_list.append(sampled_desc)   # (N, 256)
             keypoints_norm_list.append(kp_norm)       # (N, 2)
 
         output: Dict[str, object] = {

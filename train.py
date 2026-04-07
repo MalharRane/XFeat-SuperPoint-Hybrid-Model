@@ -78,7 +78,7 @@ DEFAULT_CONFIG = {
     'image_width':    640,
 
     # Model
-    'num_keypoints':  2048,
+    'num_keypoints':  1024,
     'nms_radius':     4,
     'descriptor_dim': 256,
 
@@ -86,24 +86,27 @@ DEFAULT_CONFIG = {
     'positive_margin':          1.0,
     'negative_margin':          0.2,
     'lambda_d':                 250.0,
+    'lambda_rep':               0.5,
     'correspondence_threshold': 8.0,
 
     # Training
     'batch_size':       4,
     'num_workers':      4,
     'max_epochs':       50,
-    'lr':               3e-4,
-    'lr_decay_factor':  0.5,
-    'lr_decay_epochs':  [20, 35, 45],
+    'lr':               1e-4,
+    'lr_patience':      5,       # ReduceLROnPlateau patience
+    'lr_factor':        0.5,     # ReduceLROnPlateau factor
+    'min_lr':           1e-6,    # minimum learning rate
     'weight_decay':     1e-4,
     'grad_clip_norm':   10.0,
     'mixed_precision':  True,
+    'early_stop_patience': 10,
 
     # Checkpointing
     'checkpoint_dir':  'checkpoints',
     'log_dir':         'runs',
-    'save_every':      5,        # save checkpoint every N epochs
-    'val_every':       1,        # validate every N epochs
+    'save_every':      5,
+    'val_every':       1,
 
     # Data
     'min_overlap':   0.15,
@@ -227,42 +230,58 @@ def train_step(
     Pipeline
     --------
     1. Forward image1 and image2 through HybridModel (training mode)
-    2. Compute HomographyHingeLoss across the pairs
+    2. Compute score-weighted HomographyHingeLoss (+ repeatability reward)
     3. Backward + gradient clip + optimizer step
-    """
-    image1 = batch['image1'].to(device)        # (B, 1, H, W)
-    image2 = batch['image2'].to(device)        # (B, 1, H, W)
-    homographies = batch['homography'].to(device)  # (B, 3, 3)
 
+    Gradient path
+    -------------
+    loss → score weights W[i,j] = score1[i]*score2[j]
+         → score values (differentiable via boolean-mask indexing on sm)
+         → sm = f(heatmap logits)
+         → XFeat kp_head parameters  ← updated by Adam
+    """
+    image1 = batch['image1'].to(device)
+    image2 = batch['image2'].to(device)
+    homographies = batch['homography'].to(device)
     B = image1.shape[0]
+
+    # Optional depth-based warp fields (more accurate than planar H)
+    warp_fields = batch.get('warp_field')
+    warp_valids = batch.get('warp_valid')
+    if isinstance(warp_fields, torch.Tensor):
+        warp_fields = warp_fields.to(device)
+    else:
+        warp_fields = None
+    if isinstance(warp_valids, torch.Tensor):
+        warp_valids = warp_valids.to(device)
+    else:
+        warp_valids = None
 
     optimizer.zero_grad(set_to_none=True)
 
     with autocast(enabled=cfg.get('mixed_precision', True)):
-        # Forward pass (returns intermediates for loss computation)
         out1 = model.forward_train(image1)
         out2 = model.forward_train(image2)
 
-        # Compute hinge loss over the batch
         loss, stats = loss_fn.forward_batch(
-            desc1_list=out1['descriptors'],     # list of (256, N) → transpose
+            desc1_list=out1['descriptors'],      # (N, 256) — correct shape
             desc2_list=out2['descriptors'],
             kp1_list=out1['keypoints_px'],
             kp2_list=out2['keypoints_px'],
             homographies=homographies,
             image2_hws=[(image2.shape[2], image2.shape[3])] * B,
+            scores1_list=out1.get('scores'),     # enables gradient to kp_head
+            scores2_list=out2.get('scores'),
+            warp_fields=warp_fields,
+            warp_valids=warp_valids,
         )
 
-    # Backward
     scaler.scale(loss).backward()
-
-    # Gradient clipping (prevents exploding gradients with large λd)
     scaler.unscale_(optimizer)
     nn.utils.clip_grad_norm_(
         model.parameters(),
         max_norm=cfg.get('grad_clip_norm', 10.0)
     )
-
     scaler.step(optimizer)
     scaler.update()
 
@@ -295,6 +314,17 @@ def validate(
         homographies = batch['homography'].to(device)
         B = image1.shape[0]
 
+        warp_fields = batch.get('warp_field')
+        warp_valids = batch.get('warp_valid')
+        if isinstance(warp_fields, torch.Tensor):
+            warp_fields = warp_fields.to(device)
+        else:
+            warp_fields = None
+        if isinstance(warp_valids, torch.Tensor):
+            warp_valids = warp_valids.to(device)
+        else:
+            warp_valids = None
+
         out1 = model.forward_train(image1)
         out2 = model.forward_train(image2)
 
@@ -305,6 +335,10 @@ def validate(
             kp2_list=out2['keypoints_px'],
             homographies=homographies,
             image2_hws=[(image2.shape[2], image2.shape[3])] * B,
+            scores1_list=out1.get('scores'),
+            scores2_list=out2.get('scores'),
+            warp_fields=warp_fields,
+            warp_valids=warp_valids,
         )
 
         for k, v in stats.items():
@@ -386,6 +420,7 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
         positive_margin=cfg['positive_margin'],
         negative_margin=cfg['negative_margin'],
         lambda_d=cfg['lambda_d'],
+        lambda_rep=cfg.get('lambda_rep', 0.5),
         correspondence_threshold=cfg['correspondence_threshold'],
     )
 
@@ -395,10 +430,14 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
         lr=cfg['lr'],
         weight_decay=cfg['weight_decay'],
     )
-    scheduler = optim.lr_scheduler.MultiStepLR(
+    # ReduceLROnPlateau adjusts lr based on val loss — more adaptive than
+    # a fixed milestone schedule and works well when early stopping is used.
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        milestones=cfg['lr_decay_epochs'],
-        gamma=cfg['lr_decay_factor'],
+        mode='min',
+        factor=cfg.get('lr_factor', 0.5),
+        patience=cfg.get('lr_patience', 5),
+        min_lr=cfg.get('min_lr', 1e-6),
     )
     scaler = GradScaler(enabled=cfg.get('mixed_precision', True))
 
@@ -411,6 +450,14 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
         scene_info_dir=cfg.get('scene_info_dir'),
         min_overlap=cfg['min_overlap'], max_overlap=cfg['max_overlap'],
         augment=cfg['augment'],
+    )
+    val_loader = build_dataloader(
+        mode=cfg['mode'], root=cfg['data_root'],
+        image_size=image_size, batch_size=cfg['batch_size'],
+        num_workers=cfg['num_workers'], shuffle=False,
+        scene_info_dir=cfg.get('scene_info_dir'),
+        min_overlap=cfg['min_overlap'], max_overlap=cfg['max_overlap'],
+        augment=False,
     )
 
     # ── Tensorboard ─────────────────────────────────────────────────────
@@ -425,6 +472,8 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
     model.train()
     best_loss = float('inf')
     global_step = 0
+    bad_epochs = 0
+    early_stop_patience = cfg.get('early_stop_patience', 10)
 
     for epoch in range(start_epoch, cfg['max_epochs']):
         epoch_stats: Dict[str, float] = {}
@@ -446,6 +495,7 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
                 log.info(
                     f"E{epoch:03d} [{batch_idx:04d}/{len(train_loader):04d}]  "
                     f"loss={stats.get('loss', 0):.4f}  "
+                    f"hinge={stats.get('hinge', 0):.4f}  "
                     f"pos_sim={stats.get('pos_sim_mean', 0):.3f}  "
                     f"neg_sim={stats.get('neg_sim_mean', 0):.3f}  "
                     f"lr={lr:.2e}"
@@ -454,31 +504,60 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
                     writer.add_scalar(f'train_step/{k}', v, global_step)
 
         # Epoch averages
-        n_batches = len(train_loader)
-        avg_loss = epoch_stats.get('loss', 0.0) / n_batches
-        elapsed  = time.time() - t0
-        log.info(
-            f"\n── Epoch {epoch:03d}  avg_loss={avg_loss:.4f}  "
-            f"time={elapsed:.1f}s ──\n"
-        )
+        n_batches = max(len(train_loader), 1)
+        avg_train_loss = epoch_stats.get('loss', 0.0) / n_batches
+        elapsed = time.time() - t0
+
         for k, v in epoch_stats.items():
             writer.add_scalar(f'train_epoch/{k}', v / n_batches, epoch)
 
-        # Scheduler step
-        scheduler.step()
+        # Validation
+        val_stats: Dict[str, float] = {}
+        if (epoch + 1) % cfg.get('val_every', 1) == 0:
+            val_stats = validate(model, val_loader, loss_fn, device)
+            val_loss = val_stats.get('loss', float('inf'))
+            for k, v in val_stats.items():
+                writer.add_scalar(f'val/{k}', v, epoch)
+        else:
+            val_loss = avg_train_loss  # fallback when not validating
 
-        # Checkpoint
-        is_best = avg_loss < best_loss
+        # ReduceLROnPlateau — step on val loss
+        scheduler.step(val_loss)
+
+        is_best = val_loss < best_loss
         if is_best:
-            best_loss = avg_loss
+            best_loss = val_loss
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+
+        lr = optimizer.param_groups[0]['lr']
+        log.info(
+            f"\n── Epoch {epoch:03d}  "
+            f"train_loss={avg_train_loss:.4f}  "
+            f"val_loss={val_loss:.4f}  "
+            f"pos_sim={val_stats.get('pos_sim_mean', 0):.3f}  "
+            f"neg_sim={val_stats.get('neg_sim_mean', 0):.3f}  "
+            f"bad={bad_epochs}/{early_stop_patience}  "
+            f"lr={lr:.2e}  {elapsed:.1f}s "
+            f"{'★ BEST' if is_best else ''} ──\n"
+        )
 
         if (epoch + 1) % cfg['save_every'] == 0 or is_best:
             save_checkpoint(
-                model, optimizer, scaler, epoch, avg_loss, cfg, is_best
+                model, optimizer, scaler, epoch, val_loss, cfg, is_best
             )
 
+        # Early stopping
+        if bad_epochs >= early_stop_patience:
+            log.info(
+                f"Early stopping at epoch {epoch} "
+                f"(no val improvement for {early_stop_patience} epochs)."
+            )
+            break
+
     writer.close()
-    log.info("Training complete.")
+    log.info(f"Training complete. Best val loss: {best_loss:.4f}")
 
 
 # ---------------------------------------------------------------------------
