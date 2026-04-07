@@ -38,6 +38,7 @@ image_width:  640          # W — must be divisible by 8
 # ---------------------------------------------------------------------------
 num_keypoints:  1024       # Maximum keypoints extracted per image
 nms_radius:     4          # NMS window half-radius (pixels)
+min_keypoint_score: 0.01   # Drop low-confidence detections (helps suppress sky noise)
 descriptor_dim: 256        # SuperPoint descriptor dimensionality (fixed)
 
 # ---------------------------------------------------------------------------

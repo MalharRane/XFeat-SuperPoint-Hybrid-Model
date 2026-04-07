@@ -80,6 +80,7 @@ DEFAULT_CONFIG = {
     # Model
     'num_keypoints':  1024,
     'nms_radius':     4,
+    'min_keypoint_score': 0.01,
     'descriptor_dim': 256,
 
     # Loss
@@ -298,6 +299,7 @@ def build_model(cfg: Dict, device: torch.device) -> HybridModel:
         superpoint_core=superpoint,
         num_keypoints=cfg['num_keypoints'],
         nms_radius=cfg['nms_radius'],
+        min_keypoint_score=cfg['min_keypoint_score'],
         descriptor_dim=cfg['descriptor_dim'],
     ).to(device)
 
@@ -756,6 +758,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--min_lr',       type=float, help='Minimum learning rate')
     p.add_argument('--early_stop_patience', type=int, help='Early stopping patience')
     p.add_argument('--num_keypoints',type=int, help='Max keypoints per image')
+    p.add_argument('--min_keypoint_score', type=float,
+                   help='Drop keypoints below this score before top-K')
     p.add_argument('--checkpoint_dir', type=str, help='Checkpoint directory')
     p.add_argument('--log_dir',      type=str, help='TensorBoard log directory')
     p.add_argument('--lambda_d',     type=float, help='Positive hinge weight')

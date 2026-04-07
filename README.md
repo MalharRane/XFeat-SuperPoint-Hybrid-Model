@@ -163,6 +163,7 @@ python train.py \
 - `max_pairs_per_scene`: increase MegaDepth supervision density per scene.
 - `lr_patience`, `lr_factor`, `lr_threshold`: control faster/stronger LR decay on plateaus.
 - `lambda_d`, `lambda_rep`, `correspondence_threshold`: loss sweep knobs for better positive/negative separation.
+- `min_keypoint_score`: discard weak detections before top-K (reduces low-texture sky points).
 - `unfreeze_at_epoch` + `unfreeze_keywords`: staged unfreezing of additional XFeat modules.
 - `model_selection_metric`: choose checkpointing signal (`loss`, `sim_gap`, or `repeatability`).
 - Validation now logs:
