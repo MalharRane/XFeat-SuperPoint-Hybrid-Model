@@ -554,7 +554,7 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
     # ── Training Loop ───────────────────────────────────────────────────
     model.train()
     best_val_loss = float('inf')
-    selected_best_val_loss = float('inf')
+    best_checkpoint_val_loss = float('inf')
     best_score = float('-inf')
     global_step = 0
     bad_epochs = 0
@@ -645,7 +645,7 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
         is_best = score > best_score
         if is_best:
             best_score = score
-            selected_best_val_loss = val_loss
+            best_checkpoint_val_loss = val_loss
             bad_epochs = 0
         else:
             bad_epochs += 1
@@ -679,16 +679,16 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
 
     writer.close()
     score_label = (
-        "best_sim_gap(higher_better)"
+        "best_sim_gap(max)"
         if selection_metric == 'sim_gap'
-        else "best_repeatability(higher_better)"
+        else "best_repeatability(max)"
         if selection_metric == 'repeatability'
-        else "best_loss(lower_better)"
+        else "best_loss(min)"
     )
     log.info(
         "Training complete. "
         f"Best val loss overall: {best_val_loss:.4f}  "
-        f"Best-checkpoint val loss: {selected_best_val_loss:.4f}  "
+        f"Best-checkpoint val loss: {best_checkpoint_val_loss:.4f}  "
         f"{score_label}={best_score:.4f}"
     )
 

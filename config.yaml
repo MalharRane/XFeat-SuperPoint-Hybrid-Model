@@ -60,7 +60,7 @@ balance_pos_neg:          true   # normalise positive/negative hinge terms separ
 # ---------------------------------------------------------------------------
 batch_size:       4          # Pairs per batch (reduce if OOM)
 num_workers:      4          # DataLoader workers (set 0 for debug)
-max_epochs:       80         # Run longer; best often appears late
+max_epochs:       80         # Longer schedule helps after late-stage LR drops on small MegaDepth splits
 lr:               1.0e-4     # Initial Adam learning rate
 weight_decay:     1.0e-4     # L2 regularisation
 lr_patience:      2          # ReduceLROnPlateau patience (epochs without improvement)
@@ -83,7 +83,7 @@ unfreeze_keywords: []        # e.g. ['block3', 'block4']
 # ---------------------------------------------------------------------------
 min_overlap: 0.15            # Min covisibility score for a valid pair
 max_overlap: 0.70            # Max covisibility (trivial pairs excluded)
-max_pairs_per_scene: 1000    # Increase pair count per scene (more supervision)
+max_pairs_per_scene: 1000    # 1000 pairs/scene (up from previous 200) for denser supervision
 augment:     true            # Photometric augmentation on image2
 
 # ---------------------------------------------------------------------------

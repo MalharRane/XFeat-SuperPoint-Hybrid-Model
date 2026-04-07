@@ -157,7 +157,7 @@ class HybridModel(nn.Module):
         int
             Number of newly-unfrozen parameters (counted by elements).
         """
-        keywords = tuple(k.strip().lower() for k in name_keywords if k and k.strip())
+        keywords = tuple(k.strip().lower() for k in name_keywords if k.strip())
         if not keywords:
             return 0
 
