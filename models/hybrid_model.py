@@ -123,17 +123,41 @@ class HybridModel(nn.Module):
                 heatmap, size=(H, W), mode='bilinear', align_corners=False
             ).squeeze(1)
         elif C == 65:
-            prob = torch.softmax(heatmap, dim=1)[:, :-1]   # drop dustbin
-            # Pixel-shuffle style reshape: (B,64,Hc,Wc) -> (B,H,W)
-            score = prob.permute(0, 2, 3, 1).reshape(B, Hc, Wc, 8, 8).permute(0, 1, 3, 2, 4).reshape(B, H, W)
+            prob = torch.softmax(heatmap, dim=1)[:, :-1]   # drop dustbin → (B,64,Hc,Wc)
+            score = self._pixel_shuffle_to_scoremap(prob, B, Hc, Wc, H, W)
         elif C == 64:
             prob = torch.sigmoid(heatmap)
-            # Pixel-shuffle style reshape: (B,64,Hc,Wc) -> (B,H,W)
-            score = prob.permute(0, 2, 3, 1).reshape(B, Hc, Wc, 8, 8).permute(0, 1, 3, 2, 4).reshape(B, H, W)
+            score = self._pixel_shuffle_to_scoremap(prob, B, Hc, Wc, H, W)
         else:
             raise ValueError(f"Expected C in {{1, 64, 65}}, got {C}")
 
         return score
+
+    @staticmethod
+    def _pixel_shuffle_to_scoremap(
+        prob: torch.Tensor,
+        B: int, Hc: int, Wc: int, H: int, W: int,
+    ) -> torch.Tensor:
+        """Reconstruct a full-resolution (B, H, W) score map from the
+        (B, 64, Hc, Wc) cell-probability tensor via pixel-shuffle.
+
+        Each cell of size 8×8 holds 64 per-pixel scores. The two
+        permute+reshape steps interleave the cell and intra-cell axes
+        to produce the spatial layout of the original image:
+
+          (B, 64, Hc, Wc)
+          → permute(0,2,3,1) → (B, Hc, Wc, 64)
+          → reshape(B,Hc,Wc,8,8) — split 64 into 8×8 intra-cell grid
+          → permute(0,1,3,2,4)  → (B, Hc, 8, Wc, 8) — interleave axes
+          → reshape(B, H, W)    — merge to full resolution (H=Hc*8, W=Wc*8)
+        """
+        return (
+            prob
+            .permute(0, 2, 3, 1)            # (B, Hc, Wc, 64)
+            .reshape(B, Hc, Wc, 8, 8)       # (B, Hc, Wc, 8, 8)
+            .permute(0, 1, 3, 2, 4)          # (B, Hc, 8, Wc, 8)
+            .reshape(B, H, W)                # (B, H, W)
+        )
 
     def _decode_xfeat_heatmap(
         self,
