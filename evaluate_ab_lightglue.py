@@ -66,7 +66,7 @@ def _load_checkpoint_weights(model: torch.nn.Module, ckpt_path: str, device: tor
 def _to_optional_tensor_batch(
     value: object,
     device: torch.device,
-) -> Optional[torch.Tensor | List[Optional[torch.Tensor]]]:
+) -> Optional[Union[torch.Tensor, List[Optional[torch.Tensor]]]]:
     if isinstance(value, torch.Tensor):
         return value.to(device)
     if isinstance(value, list):
@@ -382,7 +382,13 @@ def _print_summary(title: str, metrics: Dict[str, float]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fixed A/B benchmark with LightGlue matching.")
     parser.add_argument("--config", type=str, default=None, help="Path to config.yaml")
-    parser.add_argument("--mode", type=str, default=None, choices=["synthetic", "megadepth"])
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default=None,
+        choices=["synthetic", "megadepth"],
+        help="Dataset mode ('megadepth' corresponds to MegaDepth).",
+    )
     parser.add_argument("--data_root", type=str, default=None)
     parser.add_argument("--scene_info_dir", type=str, default=None)
     parser.add_argument("--old_ckpt", type=str, required=True, help="Baseline checkpoint")
