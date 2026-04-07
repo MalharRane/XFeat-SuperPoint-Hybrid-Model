@@ -26,6 +26,7 @@ class HybridModel(nn.Module):
         superpoint_core: nn.Module,
         num_keypoints: int = 512,      # reduced from 1024
         nms_radius: int = 8,           # increased from 4
+        min_keypoint_score: float = 0.01,
         descriptor_dim: int = 256,
         border_margin: int = 16,       # suppress border-heavy artifacts
         xfeat_kp_head_attrs: Tuple[str, ...] = (
@@ -52,6 +53,7 @@ class HybridModel(nn.Module):
 
         self.num_keypoints = num_keypoints
         self.nms_radius = nms_radius
+        self.min_keypoint_score = float(min_keypoint_score)
         self.descriptor_dim = descriptor_dim
         self.border_margin = border_margin
 
@@ -292,6 +294,11 @@ class HybridModel(nn.Module):
             # Boolean-mask indexing on sm (not sm_d) — values remain
             # differentiable w.r.t. heatmap ✓
             s = sm[nms_mask]                        # (K,)
+
+            if self.min_keypoint_score > 0.0 and s.numel() > 0:
+                keep = s >= self.min_keypoint_score
+                yx = yx[keep]
+                s = s[keep]
 
             if yx.shape[0] == 0:
                 flat_idx = sm_d.flatten().topk(
