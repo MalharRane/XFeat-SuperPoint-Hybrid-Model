@@ -235,13 +235,8 @@ def _compute_pair_metrics(
         for t in mma_thresholds
     }
 
-    inlier_ratio = 0.0
-    if n_matches >= 4:
-        src = kp1.detach().cpu().numpy().astype(np.float32)
-        dst = kp2.detach().cpu().numpy().astype(np.float32)
-        _, inlier_mask = cv2.findHomography(src, dst, cv2.RANSAC, ransac_threshold)
-        if inlier_mask is not None:
-            inlier_ratio = float(inlier_mask.mean())
+    inlier_mask = _compute_ransac_inlier_mask(kp1, kp2, ransac_threshold)
+    inlier_ratio = float(inlier_mask.mean()) if inlier_mask is not None else 0.0
 
     _, stats = loss_fn.forward_batch(
         desc1_list=out1["descriptors"],
@@ -267,6 +262,24 @@ def _compute_pair_metrics(
     return metrics
 
 
+def _compute_ransac_inlier_mask(
+    kp1: torch.Tensor,
+    kp2: torch.Tensor,
+    ransac_threshold: float,
+) -> Optional[np.ndarray]:
+    if kp1.shape[0] < 4 or kp2.shape[0] < 4:
+        return None
+    _, inlier_mask = cv2.findHomography(
+        kp1.detach().cpu().numpy().astype(np.float32),
+        kp2.detach().cpu().numpy().astype(np.float32),
+        cv2.RANSAC,
+        ransac_threshold,
+    )
+    if inlier_mask is None:
+        return None
+    return inlier_mask.reshape(-1).astype(bool)
+
+
 def _draw_matches(
     image1: torch.Tensor,
     image2: torch.Tensor,
@@ -290,7 +303,7 @@ def _draw_matches(
     k2_shift[:, 0] += w
 
     for i in range(k1.shape[0]):
-        is_inlier = bool(inlier_mask[i]) if inlier_mask is not None and i < len(inlier_mask) else False
+        is_inlier = bool(inlier_mask[i]) if inlier_mask is not None else False
         color = "lime" if is_inlier else "red"
         plt.plot([k1[i, 0], k2_shift[i, 0]], [k1[i, 1], k2_shift[i, 1]], color=color, linewidth=0.7, alpha=0.8)
     plt.scatter(k1[:, 0], k1[:, 1], s=8, c="cyan")
@@ -351,16 +364,8 @@ def _evaluate_checkpoint(
                 if idx0.numel() > 0:
                     kp1 = out1["keypoints_px"][0][idx0]
                     kp2 = out2["keypoints_px"][0][idx1]
-                    inlier_mask = None
-                    if kp1.shape[0] >= 4:
-                        # We only need the inlier mask for visualization coloring.
-                        _, inlier_mask = cv2.findHomography(
-                            kp1.cpu().numpy().astype(np.float32),
-                            kp2.cpu().numpy().astype(np.float32),
-                            cv2.RANSAC,
-                            ransac_threshold,
-                        )
-                        inlier_mask = inlier_mask.reshape(-1).astype(bool) if inlier_mask is not None else None
+                    # We only need the inlier mask for visualization coloring.
+                    inlier_mask = _compute_ransac_inlier_mask(kp1, kp2, ransac_threshold)
                     _draw_matches(
                         image1=pair["image1"],
                         image2=pair["image2"],
