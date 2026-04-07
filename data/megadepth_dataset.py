@@ -625,6 +625,7 @@ def build_dataloader(
     scene_info_dir:    Optional[str] = None,
     min_overlap:       float = 0.15,
     max_overlap:       float = 0.70,
+    max_pairs_per_scene: int = 200,
     augment:           bool  = True,
 ) -> DataLoader:
     """
@@ -648,6 +649,7 @@ def build_dataloader(
             image_size=image_size,
             min_overlap=min_overlap,
             max_overlap=max_overlap,
+            max_pairs_per_scene=max_pairs_per_scene,
             augment=augment,
         )
     else:

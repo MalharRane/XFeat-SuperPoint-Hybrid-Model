@@ -28,7 +28,7 @@ import argparse
 import yaml
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -99,10 +99,13 @@ DEFAULT_CONFIG = {
     'lr_patience':      3,       # ReduceLROnPlateau patience
     'lr_factor':        0.5,     # ReduceLROnPlateau factor
     'min_lr':           1e-6,    # minimum learning rate
+    'lr_threshold':     1e-4,    # ReduceLROnPlateau threshold
+    'lr_cooldown':      0,       # ReduceLROnPlateau cooldown
     'weight_decay':     1e-4,
     'grad_clip_norm':   10.0,
     'mixed_precision':  True,
     'early_stop_patience': 10,
+    'model_selection_metric': 'loss',  # 'loss' | 'sim_gap' | 'repeatability'
 
     # Checkpointing
     'checkpoint_dir':  'checkpoints',
@@ -113,7 +116,24 @@ DEFAULT_CONFIG = {
     # Data
     'min_overlap':   0.15,
     'max_overlap':   0.70,
+    'max_pairs_per_scene': 1000,
     'augment':       True,
+    'val_max_batches': 50,
+
+    # Optional staged capacity expansion
+    'unfreeze_at_epoch': None,
+    'unfreeze_keywords': [],
+
+    # Optional 2-stage schedule (synthetic -> megadepth)
+    'two_stage': False,
+    'synthetic_data_root': None,
+    'megadepth_data_root': None,
+    'stage1_epochs': 30,
+    'stage2_epochs': 50,
+    'stage1_checkpoint_subdir': 'stage1_synthetic',
+    'stage2_checkpoint_subdir': 'stage2_megadepth',
+    'stage1_log_subdir': 'stage1_synthetic',
+    'stage2_log_subdir': 'stage2_megadepth',
 }
 
 
@@ -134,6 +154,58 @@ def _to_optional_tensor_batch(
     return None
 
 
+def _normalize_keywords(value: Any) -> Tuple[str, ...]:
+    if value is None:
+        return tuple()
+    if isinstance(value, str):
+        return tuple(v.strip() for v in value.split(',') if v.strip())
+    if isinstance(value, Sequence):
+        normalized_keywords: List[str] = []
+        for v in value:
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s:
+                normalized_keywords.append(s)
+        return tuple(normalized_keywords)
+    return tuple()
+
+
+def _add_new_trainable_params_to_optimizer(
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    lr: float,
+    weight_decay: float,
+) -> int:
+    existing = {id(p) for group in optimizer.param_groups for p in group['params']}
+    new_params = [
+        p for p in model.parameters()
+        if p.requires_grad and id(p) not in existing
+    ]
+    if not new_params:
+        return 0
+
+    optimizer.add_param_group({
+        'params': new_params,
+        'lr': lr,
+        'weight_decay': weight_decay,
+    })
+    return sum(p.numel() for p in new_params)
+
+
+def _pick_model_score(
+    metric: str,
+    val_stats: Dict[str, float],
+    val_loss: float,
+) -> float:
+    metric = str(metric or 'loss').lower()
+    if metric == 'sim_gap':
+        return val_stats.get('sim_gap', float('-inf'))
+    if metric == 'repeatability':
+        return val_stats.get('repeatability_mean', float('-inf'))
+    return -val_loss
+
+
 def load_config(config_path: Optional[str], cli_args: argparse.Namespace) -> Dict:
     """Merge default config with YAML file and CLI overrides."""
     cfg = DEFAULT_CONFIG.copy()
@@ -148,6 +220,8 @@ def load_config(config_path: Optional[str], cli_args: argparse.Namespace) -> Dic
     for key, val in vars(cli_args).items():
         if val is not None and key in cfg:
             cfg[key] = val
+
+    cfg['unfreeze_keywords'] = list(_normalize_keywords(cfg.get('unfreeze_keywords')))
 
     return cfg
 
@@ -442,6 +516,8 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
         mode='min',
         factor=cfg.get('lr_factor', 0.5),
         patience=cfg.get('lr_patience', 5),
+        threshold=cfg.get('lr_threshold', 1e-4),
+        cooldown=cfg.get('lr_cooldown', 0),
         min_lr=cfg.get('min_lr', 1e-6),
     )
     scaler = GradScaler('cuda', enabled=cfg.get('mixed_precision', True))
@@ -454,6 +530,7 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
         num_workers=cfg['num_workers'], shuffle=True,
         scene_info_dir=cfg.get('scene_info_dir'),
         min_overlap=cfg['min_overlap'], max_overlap=cfg['max_overlap'],
+        max_pairs_per_scene=cfg.get('max_pairs_per_scene', 1000),
         augment=cfg['augment'],
     )
     val_loader = build_dataloader(
@@ -462,6 +539,7 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
         num_workers=cfg['num_workers'], shuffle=False,
         scene_info_dir=cfg.get('scene_info_dir'),
         min_overlap=cfg['min_overlap'], max_overlap=cfg['max_overlap'],
+        max_pairs_per_scene=cfg.get('max_pairs_per_scene', 1000),
         augment=False,
     )
 
@@ -475,12 +553,39 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
 
     # ── Training Loop ───────────────────────────────────────────────────
     model.train()
-    best_loss = float('inf')
+    best_val_loss = float('inf')
+    best_checkpoint_val_loss = float('inf')
+    best_score = float('-inf')
     global_step = 0
     bad_epochs = 0
     early_stop_patience = cfg.get('early_stop_patience', 10)
+    selection_metric = str(cfg.get('model_selection_metric', 'loss')).lower()
+    unfreeze_epoch = cfg.get('unfreeze_at_epoch')
+    unfreeze_done = False
+    unfreeze_keywords = tuple(_normalize_keywords(cfg.get('unfreeze_keywords')))
 
     for epoch in range(start_epoch, cfg['max_epochs']):
+        if (
+            not unfreeze_done
+            and unfreeze_epoch is not None
+            and epoch >= int(unfreeze_epoch)
+            and unfreeze_keywords
+        ):
+            newly_unfrozen = model.unfreeze_xfeat_modules(unfreeze_keywords)
+            newly_added = _add_new_trainable_params_to_optimizer(
+                model=model,
+                optimizer=optimizer,
+                lr=cfg['lr'],
+                weight_decay=cfg['weight_decay'],
+            )
+            if newly_unfrozen > 0:
+                log.info(
+                    f"Scheduled unfreeze activated at epoch {epoch}: "
+                    f"{newly_unfrozen:,} params unfrozen, "
+                    f"{newly_added:,} params added to optimizer."
+                )
+            unfreeze_done = True
+
         epoch_stats: Dict[str, float] = {}
         t0 = time.time()
 
@@ -519,7 +624,13 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
         # Validation
         val_stats: Dict[str, float] = {}
         if (epoch + 1) % cfg.get('val_every', 1) == 0:
-            val_stats = validate(model, val_loader, loss_fn, device)
+            val_stats = validate(
+                model,
+                val_loader,
+                loss_fn,
+                device,
+                max_batches=cfg.get('val_max_batches', 50),
+            )
             val_loss = val_stats.get('loss', float('inf'))
             for k, v in val_stats.items():
                 writer.add_scalar(f'val/{k}', v, epoch)
@@ -528,10 +639,13 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
 
         # ReduceLROnPlateau — step on val loss
         scheduler.step(val_loss)
+        best_val_loss = min(best_val_loss, val_loss)
 
-        is_best = val_loss < best_loss
+        score = _pick_model_score(selection_metric, val_stats, val_loss)
+        is_best = score > best_score
         if is_best:
-            best_loss = val_loss
+            best_score = score
+            best_checkpoint_val_loss = val_loss
             bad_epochs = 0
         else:
             bad_epochs += 1
@@ -543,6 +657,8 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
             f"val_loss={val_loss:.4f}  "
             f"pos_sim={val_stats.get('pos_sim_mean', 0):.3f}  "
             f"neg_sim={val_stats.get('neg_sim_mean', 0):.3f}  "
+            f"sim_gap={val_stats.get('sim_gap', 0):.3f}  "
+            f"repeatability={val_stats.get('repeatability_mean', 0):.3f}  "
             f"bad={bad_epochs}/{early_stop_patience}  "
             f"lr={lr:.2e}  {elapsed:.1f}s "
             f"{'★ BEST' if is_best else ''} ──\n"
@@ -562,7 +678,63 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
             break
 
     writer.close()
-    log.info(f"Training complete. Best val loss: {best_loss:.4f}")
+    score_label = (
+        "best_sim_gap(max)"
+        if selection_metric == 'sim_gap'
+        else "best_repeatability(max)"
+        if selection_metric == 'repeatability'
+        else "best_loss(min)"
+    )
+    log.info(
+        "Training complete. "
+        f"Best val loss overall: {best_val_loss:.4f}  "
+        f"Best-checkpoint val loss: {best_checkpoint_val_loss:.4f}  "
+        f"{score_label}={best_score:.4f}"
+    )
+
+
+def train_two_stage(cfg: Dict) -> None:
+    """
+    Run synthetic pre-training then MegaDepth fine-tuning.
+    """
+    root_ckpt = Path(cfg['checkpoint_dir'])
+    root_log = Path(cfg['log_dir'])
+
+    stage1_cfg = cfg.copy()
+    stage1_cfg.update({
+        'mode': 'synthetic',
+        'data_root': cfg.get('synthetic_data_root') or cfg['data_root'],
+        'max_epochs': int(cfg.get('stage1_epochs', 30)),
+        'checkpoint_dir': str(root_ckpt / cfg.get('stage1_checkpoint_subdir', 'stage1_synthetic')),
+        'log_dir': str(root_log / cfg.get('stage1_log_subdir', 'stage1_synthetic')),
+    })
+
+    stage2_cfg = cfg.copy()
+    stage2_cfg.update({
+        'mode': 'megadepth',
+        'data_root': cfg.get('megadepth_data_root') or cfg['data_root'],
+        'max_epochs': int(cfg.get('stage2_epochs', 50)),
+        'checkpoint_dir': str(root_ckpt / cfg.get('stage2_checkpoint_subdir', 'stage2_megadepth')),
+        'log_dir': str(root_log / cfg.get('stage2_log_subdir', 'stage2_megadepth')),
+    })
+
+    Path(stage1_cfg['checkpoint_dir']).mkdir(parents=True, exist_ok=True)
+    Path(stage1_cfg['log_dir']).mkdir(parents=True, exist_ok=True)
+    Path(stage2_cfg['checkpoint_dir']).mkdir(parents=True, exist_ok=True)
+    Path(stage2_cfg['log_dir']).mkdir(parents=True, exist_ok=True)
+
+    log.info("Starting stage 1/2: synthetic pre-training")
+    train(stage1_cfg, resume=None)
+
+    stage1_best = Path(stage1_cfg['checkpoint_dir']) / 'best.pth'
+    if not stage1_best.exists():
+        raise FileNotFoundError(
+            f"Stage-1 checkpoint not found: {stage1_best}. "
+            "Ensure stage-1 completed and produced a best checkpoint."
+        )
+
+    log.info("Starting stage 2/2: MegaDepth fine-tuning from stage-1 best")
+    train(stage2_cfg, resume=str(stage1_best))
 
 
 # ---------------------------------------------------------------------------
@@ -579,8 +751,36 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--batch_size',   type=int, help='Batch size')
     p.add_argument('--max_epochs',   type=int, help='Number of epochs')
     p.add_argument('--lr',           type=float, help='Learning rate')
+    p.add_argument('--lr_patience',  type=int, help='ReduceLROnPlateau patience')
+    p.add_argument('--lr_factor',    type=float, help='ReduceLROnPlateau factor')
+    p.add_argument('--min_lr',       type=float, help='Minimum learning rate')
+    p.add_argument('--early_stop_patience', type=int, help='Early stopping patience')
     p.add_argument('--num_keypoints',type=int, help='Max keypoints per image')
     p.add_argument('--checkpoint_dir', type=str, help='Checkpoint directory')
+    p.add_argument('--log_dir',      type=str, help='TensorBoard log directory')
+    p.add_argument('--lambda_d',     type=float, help='Positive hinge weight')
+    p.add_argument('--lambda_rep',   type=float, help='Repeatability reward weight')
+    p.add_argument('--correspondence_threshold', type=float,
+                   help='Positive correspondence threshold in px')
+    p.add_argument('--max_pairs_per_scene', type=int,
+                   help='Max MegaDepth pairs sampled per scene')
+    p.add_argument('--model_selection_metric', type=str,
+                   choices=['loss', 'sim_gap', 'repeatability'],
+                   help='Checkpoint selection metric')
+    p.add_argument('--val_max_batches', type=int,
+                   help='Validation batches per epoch')
+    p.add_argument('--unfreeze_at_epoch', type=int,
+                   help='Epoch to unfreeze extra XFeat params')
+    p.add_argument('--unfreeze_keywords', type=str,
+                   help='Comma-separated XFeat parameter-name keywords to unfreeze')
+    p.add_argument('--two_stage', action='store_true', default=None,
+                   help='Run synthetic pre-training then MegaDepth fine-tuning')
+    p.add_argument('--synthetic_data_root', type=str,
+                   help='Stage-1 synthetic data root')
+    p.add_argument('--megadepth_data_root', type=str,
+                   help='Stage-2 MegaDepth data root')
+    p.add_argument('--stage1_epochs', type=int, help='Stage-1 epochs')
+    p.add_argument('--stage2_epochs', type=int, help='Stage-2 epochs')
     p.add_argument('--resume',       type=str, default=None,
                    help='Checkpoint path to resume from')
     p.add_argument('--no_amp',       action='store_true',
@@ -600,4 +800,7 @@ if __name__ == '__main__':
     Path(cfg['checkpoint_dir']).mkdir(parents=True, exist_ok=True)
     Path(cfg['log_dir']).mkdir(parents=True, exist_ok=True)
 
-    train(cfg, resume=args.resume)
+    if cfg.get('two_stage', False):
+        train_two_stage(cfg)
+    else:
+        train(cfg, resume=args.resume)

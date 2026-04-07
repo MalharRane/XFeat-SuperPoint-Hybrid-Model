@@ -148,6 +148,27 @@ python train.py \
   --max_epochs 50
 ```
 
+### One-command 2-stage training (synthetic → MegaDepth)
+```bash
+python train.py \
+  --config config.yaml \
+  --two_stage \
+  --synthetic_data_root /path/to/coco/train2017 \
+  --megadepth_data_root /path/to/megadepth \
+  --stage1_epochs 30 \
+  --stage2_epochs 50
+```
+
+### Accuracy-focused knobs
+- `max_pairs_per_scene`: increase MegaDepth supervision density per scene.
+- `lr_patience`, `lr_factor`, `lr_threshold`: control faster/stronger LR decay on plateaus.
+- `lambda_d`, `lambda_rep`, `correspondence_threshold`: loss sweep knobs for better positive/negative separation.
+- `unfreeze_at_epoch` + `unfreeze_keywords`: staged unfreezing of additional XFeat modules.
+- `model_selection_metric`: choose checkpointing signal (`loss`, `sim_gap`, or `repeatability`).
+- Validation now logs:
+  - `sim_gap = pos_sim_mean - neg_sim_mean`
+  - `repeatability_{1,2,mean}` (proxy from geometric-match coverage)
+
 ### Google Colab
 Open **`XFeat_SuperPoint_Fixed_Training.ipynb`** — it handles all setup, data download, and training automatically on MegaDepth-1500.
 
