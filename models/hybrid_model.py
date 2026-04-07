@@ -177,7 +177,6 @@ class HybridModel(nn.Module):
             f"trainable now {trainable:,}/{total:,} ({100 * trainable / max(total,1):.1f}%)"
         )
         return newly_unfrozen
-        print(f"[HybridModel] XFeat kp-head hook installed on {head.__class__.__name__}")
 
     # ------------------------------------------------------------------
     # Normalization

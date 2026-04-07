@@ -116,7 +116,7 @@ DEFAULT_CONFIG = {
     # Data
     'min_overlap':   0.15,
     'max_overlap':   0.70,
-    'max_pairs_per_scene': 200,
+    'max_pairs_per_scene': 1000,
     'augment':       True,
     'val_max_batches': 50,
 
@@ -160,14 +160,14 @@ def _normalise_keywords(value: Any) -> Tuple[str, ...]:
     if isinstance(value, str):
         return tuple(v.strip() for v in value.split(',') if v.strip())
     if isinstance(value, Sequence):
-        out: List[str] = []
+        normalized_keywords: List[str] = []
         for v in value:
             if v is None:
                 continue
             s = str(v).strip()
             if s:
-                out.append(s)
-        return tuple(out)
+                normalized_keywords.append(s)
+        return tuple(normalized_keywords)
     return tuple()
 
 
@@ -530,7 +530,7 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
         num_workers=cfg['num_workers'], shuffle=True,
         scene_info_dir=cfg.get('scene_info_dir'),
         min_overlap=cfg['min_overlap'], max_overlap=cfg['max_overlap'],
-        max_pairs_per_scene=cfg.get('max_pairs_per_scene', 200),
+        max_pairs_per_scene=cfg.get('max_pairs_per_scene', 1000),
         augment=cfg['augment'],
     )
     val_loader = build_dataloader(
@@ -539,7 +539,7 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
         num_workers=cfg['num_workers'], shuffle=False,
         scene_info_dir=cfg.get('scene_info_dir'),
         min_overlap=cfg['min_overlap'], max_overlap=cfg['max_overlap'],
-        max_pairs_per_scene=cfg.get('max_pairs_per_scene', 200),
+        max_pairs_per_scene=cfg.get('max_pairs_per_scene', 1000),
         augment=False,
     )
 
@@ -676,10 +676,17 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
             break
 
     writer.close()
+    score_label = (
+        "best_sim_gap"
+        if selection_metric == 'sim_gap'
+        else "best_repeatability"
+        if selection_metric == 'repeatability'
+        else "best_neg_val_loss(higher_better)"
+    )
     log.info(
         "Training complete. "
         f"Best val loss: {best_loss:.4f}  "
-        f"best_{selection_metric}={best_score:.4f}"
+        f"{score_label}={best_score:.4f}"
     )
 
 
