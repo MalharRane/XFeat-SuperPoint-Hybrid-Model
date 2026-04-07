@@ -34,6 +34,14 @@ class HybridModel(nn.Module):
         self.xfeat = xfeat_core
         self.superpoint = superpoint_core
 
+        self._sp_desc_map: Optional[torch.Tensor] = None
+        self._sp_hook_handle = None
+
+        # Initialize XFeat hook state before gradient configuration, because
+        # _configure_xfeat_gradients may call _install_xfeat_kp_hook.
+        self._xfeat_kp_output: Optional[torch.Tensor] = None
+        self._xfeat_kp_hook_handle = None
+
         self._freeze_superpoint()
         self._configure_xfeat_gradients(xfeat_kp_head_attrs)
 
@@ -47,17 +55,12 @@ class HybridModel(nn.Module):
         self.register_buffer('xfeat_mean', torch.tensor(self._XFEAT_MEAN).view(1, 1, 1, 1))
         self.register_buffer('xfeat_std', torch.tensor(self._XFEAT_STD).view(1, 1, 1, 1))
 
-        self._sp_desc_map: Optional[torch.Tensor] = None
-        self._sp_hook_handle = None
-
         # Captures the trainable kp-head output during XFeat's forward so that
         # _forward_impl can use it directly.  This guarantees gradient flows to
         # the unfrozen head even when raw_output['keypoints'] is produced by a
         # *different* (frozen) head inside the XFeat model (e.g. heatmap_head
         # vs keypoint_head).  Without this, loss.requires_grad would be False
         # and scaler.scale(loss).backward() raises RuntimeError.
-        self._xfeat_kp_output: Optional[torch.Tensor] = None
-        self._xfeat_kp_hook_handle = None
 
     # ------------------------------------------------------------------
     # Gradient configuration
