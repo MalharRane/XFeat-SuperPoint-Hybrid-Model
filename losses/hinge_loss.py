@@ -94,7 +94,7 @@ class HomographyHingeLoss(nn.Module):
 
     correspondence_threshold : float
         τ — pixel distance below which two keypoints are corresponding.
-        Default 8.0 px.
+        Default 6.0 px.
 
     safe_radius : float
         Keypoints warped within this distance of the image border in
@@ -104,6 +104,11 @@ class HomographyHingeLoss(nn.Module):
         Weight for the repeatability reward term.  Rewards high scores
         at positions that have a geometric match in the paired image.
         Default 0.5.  Set 0.0 to disable.
+
+    balance_pos_neg : bool
+        If True, normalise positive and negative hinge terms separately
+        before averaging, which prevents the typically larger negative set
+        from dominating the loss.
     """
 
     def __init__(
@@ -111,9 +116,10 @@ class HomographyHingeLoss(nn.Module):
         positive_margin:           float = 1.0,
         negative_margin:           float = 0.2,
         lambda_d:                  float = 250.0,
-        correspondence_threshold:  float = 8.0,
+        correspondence_threshold:  float = 6.0,
         safe_radius:               float = 8.0,
         lambda_rep:                float = 0.5,
+        balance_pos_neg:           bool = True,
     ):
         super().__init__()
         assert positive_margin > negative_margin, (
@@ -126,6 +132,7 @@ class HomographyHingeLoss(nn.Module):
         self.threshold = correspondence_threshold
         self.safe_r    = safe_radius
         self.lambda_rep = lambda_rep
+        self.balance_pos_neg = balance_pos_neg
 
     # ------------------------------------------------------------------
     # Geometric helpers
@@ -327,7 +334,14 @@ class HomographyHingeLoss(nn.Module):
         neg_loss = (1.0 - S)               * W * F.relu(sim - self.mn)
 
         total_pairs = float(N * M)
-        hinge = (pos_loss + neg_loss).sum() / total_pairs
+        if self.balance_pos_neg:
+            n_pos_t = S.sum()
+            n_neg_t = (1.0 - S).sum()
+            pos_term = pos_loss.sum() / n_pos_t.clamp(min=1.0)
+            neg_term = neg_loss.sum() / n_neg_t.clamp(min=1.0)
+            hinge = 0.5 * (pos_term + neg_term)
+        else:
+            hinge = (pos_loss + neg_loss).sum() / total_pairs
 
         # ── Step 5: Repeatability reward ──────────────────────────────────
         # For positions that have a geometric match, reward high scores.
@@ -357,8 +371,16 @@ class HomographyHingeLoss(nn.Module):
                 'loss':          loss.item(),
                 'hinge':         hinge.item(),
                 'rep_loss':      rep.item() if self.lambda_rep > 0 else 0.0,
-                'pos_loss_mean': pos_loss.sum().item() / total_pairs,
-                'neg_loss_mean': neg_loss.sum().item() / total_pairs,
+                'pos_loss_mean': (
+                    pos_loss.sum().item() / max(n_pos, 1.0)
+                    if self.balance_pos_neg
+                    else pos_loss.sum().item() / total_pairs
+                ),
+                'neg_loss_mean': (
+                    neg_loss.sum().item() / max(n_neg, 1.0)
+                    if self.balance_pos_neg
+                    else neg_loss.sum().item() / total_pairs
+                ),
                 'n_pos':         n_pos,
                 'n_neg':         n_neg,
                 'pos_sim_mean':  pos_sim_mean,
@@ -382,8 +404,8 @@ class HomographyHingeLoss(nn.Module):
         image2_hws:   Optional[List[Tuple[int, int]]]  = None,
         scores1_list: Optional[List[torch.Tensor]]     = None,
         scores2_list: Optional[List[torch.Tensor]]     = None,
-        warp_fields:  Optional[torch.Tensor]           = None,
-        warp_valids:  Optional[torch.Tensor]           = None,
+        warp_fields:  Optional[Union[torch.Tensor, List[Optional[torch.Tensor]]]] = None,
+        warp_valids:  Optional[Union[torch.Tensor, List[Optional[torch.Tensor]]]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute mean loss across a batch of image pairs.
@@ -435,4 +457,3 @@ class HomographyHingeLoss(nn.Module):
         mean_stats['loss'] = mean_loss.item()
 
         return mean_loss, mean_stats
-

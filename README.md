@@ -127,7 +127,7 @@ W_ij     = score1_i · score2_j / mean(W)     ← gradient flows to kp_head
 L_rep    = -(mean score at geometrically matched positions)   ← repeatability reward
 ```
 
-Default hyperparameters (see `config.yaml`): λ_d=250, mp=1.0, mn=0.2, λ_rep=0.5, τ=8px.
+Default hyperparameters (see `config.yaml`): λ_d=250, mp=1.0, mn=0.2, λ_rep=0.5, τ=6px.
 
 ### Phase 1 — Synthetic Pre-training (recommended)
 ```bash
@@ -236,6 +236,8 @@ XFeat-SuperPoint-Hybrid-Model/
 | Auxiliary L2 loss pushed all weights toward zero | ✅ Fixed | Replaced with score-weighted hinge loss + repeatability reward |
 | SuperPoint params unfrozen but received zero gradient | ✅ Fixed | Removed incorrect `requires_grad_(True)` on frozen SP params |
 | Approximate homography inaccurate for 3-D scenes with parallax | ✅ Fixed | Optional depth-based dense warp field (when depth maps are available) |
+| Resized MegaDepth images used unscaled intrinsics | ✅ Fixed | Scale K₁/K₂ to resized image size before homography and depth reprojection |
+| Mixed batches dropped depth warp if any sample was missing it | ✅ Fixed | Preserve per-sample optional warp fields and fallback to homography only for missing samples |
 | No validation loop | ✅ Fixed | Proper val loop with early stopping |
 | `MultiStepLR` with hard-coded milestones | ✅ Fixed | `ReduceLROnPlateau` adapts to actual val loss |
 | Image H/W not divisible by 8 | ⚠️ User error | Pixel-shuffle decoder assumes 8×8 cells; resize inputs to multiples of 8 |

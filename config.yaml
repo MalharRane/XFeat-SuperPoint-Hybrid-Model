@@ -51,7 +51,9 @@ lambda_rep:               0.5    # λrep: repeatability reward weight
                                   #   matched positions, providing the positive
                                   #   gradient component to the kp_head.
                                   #   0.0 to disable (use only score-down pressure).
-correspondence_threshold: 8.0    # τ: pixel distance threshold for pos labels
+correspondence_threshold: 6.0    # τ: tighter pixel distance threshold for pos labels
+safe_radius:              8.0    # exclude warped points too close to image border
+balance_pos_neg:          true   # normalise positive/negative hinge terms separately
 
 # ---------------------------------------------------------------------------
 # Optimisation
@@ -61,7 +63,7 @@ num_workers:      4          # DataLoader workers (set 0 for debug)
 max_epochs:       50
 lr:               1.0e-4     # Initial Adam learning rate
 weight_decay:     1.0e-4     # L2 regularisation
-lr_patience:      5          # ReduceLROnPlateau patience (epochs without improvement)
+lr_patience:      3          # ReduceLROnPlateau patience (epochs without improvement)
 lr_factor:        0.5        # Multiply LR by this when plateau detected
 min_lr:           1.0e-6     # Minimum learning rate floor
 grad_clip_norm:   10.0       # Max gradient norm (important with large λd)
