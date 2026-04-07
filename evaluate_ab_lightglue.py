@@ -400,7 +400,7 @@ def main() -> None:
         type=str,
         default=None,
         choices=["synthetic", "megadepth"],
-        help="Dataset mode ('megadepth' corresponds to MegaDepth).",
+        help="Dataset mode.",
     )
     parser.add_argument("--data_root", type=str, default=None)
     parser.add_argument("--scene_info_dir", type=str, default=None)
@@ -477,7 +477,7 @@ def main() -> None:
         save_vis_count=args.save_vis_count,
     )
 
-    # Rebuild loader with same seed to keep pair ordering fixed for B.
+    # Rebuild loader with same seed to keep pair ordering fixed for new checkpoint.
     _set_seed(args.seed)
     val_loader = build_dataloader(
         mode=cfg["mode"],
