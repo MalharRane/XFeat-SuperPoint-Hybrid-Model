@@ -117,15 +117,22 @@ class HybridModel(nn.Module):
         B, C, Hc, Wc = heatmap.shape
         H, W = image_hw
 
-        if C == 65:
+        if C == 1:
+            # XFeat dense heatmap: upsample directly to full resolution
+            score = F.interpolate(
+                heatmap, size=(H, W), mode='bilinear', align_corners=False
+            ).squeeze(1)
+        elif C == 65:
             prob = torch.softmax(heatmap, dim=1)[:, :-1]   # drop dustbin
+            # Pixel-shuffle style reshape: (B,64,Hc,Wc) -> (B,H,W)
+            score = prob.permute(0, 2, 3, 1).reshape(B, Hc, Wc, 8, 8).permute(0, 1, 3, 2, 4).reshape(B, H, W)
         elif C == 64:
             prob = torch.sigmoid(heatmap)
+            # Pixel-shuffle style reshape: (B,64,Hc,Wc) -> (B,H,W)
+            score = prob.permute(0, 2, 3, 1).reshape(B, Hc, Wc, 8, 8).permute(0, 1, 3, 2, 4).reshape(B, H, W)
         else:
-            raise ValueError(f"Expected C in {{64,65}}, got {C}")
+            raise ValueError(f"Expected C in {{1, 64, 65}}, got {C}")
 
-        # Pixel-shuffle style reshape: (B,64,Hc,Wc) -> (B,H,W)
-        score = prob.permute(0, 2, 3, 1).reshape(B, Hc, Wc, 8, 8).permute(0, 1, 3, 2, 4).reshape(B, H, W)
         return score
 
     def _decode_xfeat_heatmap(
