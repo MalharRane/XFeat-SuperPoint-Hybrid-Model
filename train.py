@@ -28,7 +28,7 @@ import argparse
 import yaml
 import logging
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -87,14 +87,16 @@ DEFAULT_CONFIG = {
     'negative_margin':          0.2,
     'lambda_d':                 250.0,
     'lambda_rep':               0.5,
-    'correspondence_threshold': 8.0,
+    'correspondence_threshold': 6.0,
+    'safe_radius':              8.0,
+    'balance_pos_neg':          True,
 
     # Training
     'batch_size':       4,
     'num_workers':      4,
     'max_epochs':       50,
     'lr':               1e-4,
-    'lr_patience':      5,       # ReduceLROnPlateau patience
+    'lr_patience':      3,       # ReduceLROnPlateau patience
     'lr_factor':        0.5,     # ReduceLROnPlateau factor
     'min_lr':           1e-6,    # minimum learning rate
     'weight_decay':     1e-4,
@@ -113,6 +115,23 @@ DEFAULT_CONFIG = {
     'max_overlap':   0.70,
     'augment':       True,
 }
+
+
+def _to_optional_tensor_batch(
+    value: object,
+    device: torch.device,
+) -> Optional[Union[torch.Tensor, List[Optional[torch.Tensor]]]]:
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, list):
+        moved: List[Optional[torch.Tensor]] = []
+        for v in value:
+            if isinstance(v, torch.Tensor):
+                moved.append(v.to(device))
+            else:
+                moved.append(None)
+        return moved
+    return None
 
 
 def load_config(config_path: Optional[str], cli_args: argparse.Namespace) -> Dict:
@@ -246,16 +265,8 @@ def train_step(
     B = image1.shape[0]
 
     # Optional depth-based warp fields (more accurate than planar H)
-    warp_fields = batch.get('warp_field')
-    warp_valids = batch.get('warp_valid')
-    if isinstance(warp_fields, torch.Tensor):
-        warp_fields = warp_fields.to(device)
-    else:
-        warp_fields = None
-    if isinstance(warp_valids, torch.Tensor):
-        warp_valids = warp_valids.to(device)
-    else:
-        warp_valids = None
+    warp_fields = _to_optional_tensor_batch(batch.get('warp_field'), device)
+    warp_valids = _to_optional_tensor_batch(batch.get('warp_valid'), device)
 
     optimizer.zero_grad(set_to_none=True)
 
@@ -314,16 +325,8 @@ def validate(
         homographies = batch['homography'].to(device)
         B = image1.shape[0]
 
-        warp_fields = batch.get('warp_field')
-        warp_valids = batch.get('warp_valid')
-        if isinstance(warp_fields, torch.Tensor):
-            warp_fields = warp_fields.to(device)
-        else:
-            warp_fields = None
-        if isinstance(warp_valids, torch.Tensor):
-            warp_valids = warp_valids.to(device)
-        else:
-            warp_valids = None
+        warp_fields = _to_optional_tensor_batch(batch.get('warp_field'), device)
+        warp_valids = _to_optional_tensor_batch(batch.get('warp_valid'), device)
 
         out1 = model.forward_train(image1)
         out2 = model.forward_train(image2)
@@ -422,6 +425,8 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
         lambda_d=cfg['lambda_d'],
         lambda_rep=cfg.get('lambda_rep', 0.5),
         correspondence_threshold=cfg['correspondence_threshold'],
+        safe_radius=cfg.get('safe_radius', 8.0),
+        balance_pos_neg=cfg.get('balance_pos_neg', True),
     )
 
     # ── Optimizer + Scheduler ────────────────────────────────────────────

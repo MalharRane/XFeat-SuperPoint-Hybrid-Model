@@ -52,6 +52,29 @@ from PIL import Image
 _MIN_DEPTH_Z: float = 0.01
 
 
+def _scale_intrinsics_to_size(
+    K: np.ndarray,
+    orig_hw: Tuple[int, int],
+    target_hw: Tuple[int, int],
+) -> np.ndarray:
+    """Scale camera intrinsics from original image size to target resize."""
+    H0, W0 = orig_hw
+    Ht, Wt = target_hw
+    if H0 <= 0 or W0 <= 0:
+        raise ValueError(
+            f"Invalid original image size for intrinsics scaling: {(H0, W0)}"
+        )
+    sx = float(Wt) / float(W0)
+    sy = float(Ht) / float(H0)
+
+    K_scaled = K.astype(np.float32).copy()
+    K_scaled[0, 0] *= sx
+    K_scaled[0, 2] *= sx
+    K_scaled[1, 1] *= sy
+    K_scaled[1, 2] *= sy
+    return K_scaled
+
+
 # ---------------------------------------------------------------------------
 # Homography generation utilities
 # ---------------------------------------------------------------------------
@@ -406,12 +429,13 @@ class MegaDepthDataset(Dataset):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _load_image(path: str, size: Tuple[int, int]) -> torch.Tensor:
-        """Load image as (1, H, W) float32 in [0, 1]."""
+    def _load_image(path: str, size: Tuple[int, int]) -> Tuple[torch.Tensor, Tuple[int, int]]:
+        """Load image as (1, H, W) float32 in [0, 1], plus original (H, W)."""
         img = Image.open(path).convert('L')
+        orig_hw = (img.height, img.width)
         img = TF.resize(img, [size[0], size[1]],
                         interpolation=T.InterpolationMode.BILINEAR)
-        return TF.to_tensor(img).float()
+        return TF.to_tensor(img).float(), orig_hw
 
     @staticmethod
     def _load_depth(path: str, size: Tuple[int, int]) -> torch.Tensor:
@@ -540,13 +564,16 @@ class MegaDepthDataset(Dataset):
         pair = self.pairs[idx]
 
         try:
-            img1 = self._load_image(pair['image_path1'], self.image_size)
-            img2 = self._load_image(pair['image_path2'], self.image_size)
+            img1, img1_orig_hw = self._load_image(pair['image_path1'], self.image_size)
+            img2, img2_orig_hw = self._load_image(pair['image_path2'], self.image_size)
         except Exception:
             return self.__getitem__(random.randint(0, len(self) - 1))
 
+        K1 = _scale_intrinsics_to_size(pair['K1'], img1_orig_hw, self.image_size)
+        K2 = _scale_intrinsics_to_size(pair['K2'], img2_orig_hw, self.image_size)
+
         # Compute approximate homography (always available as fallback)
-        H = self._approx_homography(pair['K1'], pair['K2'],
+        H = self._approx_homography(K1, K2,
                                      pair['T1'], pair['T2'])
 
         # Attempt depth-based warp field for accurate correspondences.
@@ -558,7 +585,7 @@ class MegaDepthDataset(Dataset):
             try:
                 depth1 = self._load_depth(dp1, self.image_size)
                 warp_field, warp_valid = self._compute_warp_field(
-                    pair['K1'], pair['K2'],
+                    K1, K2,
                     pair['T1'], pair['T2'],
                     depth1, self.image_size,
                 )
@@ -651,9 +678,9 @@ def _collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         if all(v is None for v in vals):
             out[key] = None
         elif any(v is None for v in vals):
-            # Mixed: if any sample is missing this key, skip it entirely
-            # (training code will use the homography fallback)
-            out[key] = None
+            # Mixed optional values are preserved per-sample so downstream
+            # can use depth warp where available and homography otherwise.
+            out[key] = vals
         elif all(isinstance(v, torch.Tensor) for v in vals):
             out[key] = torch.stack(vals, dim=0)
         else:
