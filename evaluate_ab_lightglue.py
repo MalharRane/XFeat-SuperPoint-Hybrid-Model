@@ -30,7 +30,7 @@ from train import DEFAULT_CONFIG, build_model
 
 try:
     from lightglue import LightGlue  # type: ignore
-except Exception:
+except ImportError:
     LightGlue = None
 
 
