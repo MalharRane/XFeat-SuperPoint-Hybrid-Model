@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 import random
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import matplotlib.pyplot as plt
@@ -27,6 +27,11 @@ import yaml
 from data.megadepth_dataset import build_dataloader
 from losses.hinge_loss import HomographyHingeLoss
 from train import DEFAULT_CONFIG, build_model
+
+try:
+    from lightglue import LightGlue  # type: ignore
+except Exception:
+    LightGlue = None
 
 
 def _set_seed(seed: int) -> None:
@@ -148,6 +153,18 @@ def _warp_with_optional_depth(
     return warped, valid
 
 
+def _unwrap_single_sample_optional_tensor(
+    value: Optional[Union[torch.Tensor, List[Optional[torch.Tensor]]]],
+) -> Optional[torch.Tensor]:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return value[0]
+    if isinstance(value, torch.Tensor) and value.ndim >= 1:
+        return value[0]
+    return value
+
+
 def _compute_pair_metrics(
     out1: Dict[str, List[torch.Tensor]],
     out2: Dict[str, List[torch.Tensor]],
@@ -197,18 +214,14 @@ def _compute_pair_metrics(
     kp1 = kp1_all[idx0]
     kp2 = kp2_all[idx1]
 
-    warp_field = pair.get("warp_field")
-    warp_valid = pair.get("warp_valid")
-    if isinstance(warp_field, list):
-        warp_field = warp_field[0]
-    if isinstance(warp_valid, list):
-        warp_valid = warp_valid[0]
+    warp_field = _unwrap_single_sample_optional_tensor(pair.get("warp_field"))
+    warp_valid = _unwrap_single_sample_optional_tensor(pair.get("warp_valid"))
 
     gt_kp2, valid_gt = _warp_with_optional_depth(
         kp1=kp1,
         homography=pair["homography"][0],
-        warp_field=warp_field[0] if isinstance(warp_field, torch.Tensor) and warp_field.ndim == 4 else warp_field,
-        warp_valid=warp_valid[0] if isinstance(warp_valid, torch.Tensor) and warp_valid.ndim == 3 else warp_valid,
+        warp_field=warp_field,
+        warp_valid=warp_valid,
     )
 
     errs = torch.norm(gt_kp2 - kp2, dim=1)
@@ -416,13 +429,11 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     mma_thresholds = _parse_thresholds(args.mma_thresholds)
 
-    try:
-        from lightglue import LightGlue  # type: ignore
-    except Exception as e:
+    if LightGlue is None:
         raise RuntimeError(
             "LightGlue is required for this benchmark. Install it in your environment "
             "(e.g. pip install lightglue)."
-        ) from e
+        )
 
     matcher = LightGlue(features="superpoint").eval().to(device)
     loss_fn = HomographyHingeLoss(
