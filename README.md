@@ -172,6 +172,32 @@ python train.py \
 ### Google Colab
 Open **`XFeat_SuperPoint_Fixed_Training.ipynb`** — it handles all setup, data download, and training automatically on MegaDepth-1500.
 
+### Fixed A/B benchmark + LightGlue match inspection
+
+Use the same held-out pairs to compare two checkpoints and inspect matching quality:
+
+```bash
+python evaluate_ab_lightglue.py \
+  --config config.yaml \
+  --mode megadepth \
+  --data_root /path/to/megadepth \
+  --scene_info_dir /path/to/scene_info \
+  --old_ckpt /path/to/old_best.pth \
+  --new_ckpt /path/to/new_best.pth \
+  --num_pairs 100 \
+  --mma_thresholds 1,3,5 \
+  --precision_threshold 3.0 \
+  --save_vis_count 10
+```
+
+Outputs:
+- `summary.yaml` with A/B metrics and `delta_new_minus_old`
+- Mean metrics: `inlier_ratio`, `mma@1/3/5px`, `precision`, `n_matches`
+- Sanity diagnostics: `sim_gap`, `repeatability_mean`
+- Match visualizations (inlier/outlier colored lines) in `benchmarks/ab_lightglue/{old_vis,new_vis}/`
+
+> Requires LightGlue in your environment (`pip install lightglue`).
+
 ---
 
 ## Inference
