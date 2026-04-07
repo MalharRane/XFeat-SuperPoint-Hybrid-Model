@@ -310,8 +310,15 @@ class HomographyHingeLoss(nn.Module):
         # poor descriptor matches.  The repeatability reward below provides
         # the complementary positive signal (raises scores at matched spots).
         if scores1 is not None and scores2 is not None:
+            # Cast to float32: scores come from XFeat's heatmap which runs in
+            # float16 under torch.amp.autocast.  Keeping them in float16 causes
+            # clamp(min=1e-8) to silently become clamp(min=0) (1e-8 is below
+            # the float16 minimum positive normal ~6e-5), so W.mean() can be 0
+            # and W / 0 → inf → NaN loss.  float32 avoids this completely.
+            scores1 = scores1.float()
+            scores2 = scores2.float()
             W = scores1.unsqueeze(1) * scores2.unsqueeze(0)  # (N, M)
-            W = W / W.mean().clamp(min=1e-8)                 # mean-normalise
+            W = W / W.mean().clamp(min=1e-6)                 # rescale so mean(W) ≈ 1
         else:
             W = torch.ones(N, M, device=device, dtype=sim.dtype)
 
