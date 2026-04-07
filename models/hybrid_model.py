@@ -50,6 +50,15 @@ class HybridModel(nn.Module):
         self._sp_desc_map: Optional[torch.Tensor] = None
         self._sp_hook_handle = None
 
+        # Captures the trainable kp-head output during XFeat's forward so that
+        # _forward_impl can use it directly.  This guarantees gradient flows to
+        # the unfrozen head even when raw_output['keypoints'] is produced by a
+        # *different* (frozen) head inside the XFeat model (e.g. heatmap_head
+        # vs keypoint_head).  Without this, loss.requires_grad would be False
+        # and scaler.scale(loss).backward() raises RuntimeError.
+        self._xfeat_kp_output: Optional[torch.Tensor] = None
+        self._xfeat_kp_hook_handle = None
+
     # ------------------------------------------------------------------
     # Gradient configuration
     # ------------------------------------------------------------------
@@ -78,14 +87,19 @@ class HybridModel(nn.Module):
                 for p in head.parameters():
                     p.requires_grad_(True)
                 print(f"[HybridModel] XFeat keypoint head '{attr}' UNFROZEN")
+                self._install_xfeat_kp_hook(head)
                 unfrozen = True
                 break
 
         if not unfrozen:
+            hooked = False
             for name, mod in self.xfeat.named_modules():
                 if any(kw in name.lower() for kw in ('kp', 'keypoint', 'det')):
                     for p in mod.parameters():
                         p.requires_grad_(True)
+                    if not hooked:
+                        self._install_xfeat_kp_hook(mod)
+                        hooked = True
                     unfrozen = True
             if unfrozen:
                 print("[HybridModel] XFeat keypoint head found via name-scan and UNFROZEN")
@@ -97,6 +111,31 @@ class HybridModel(nn.Module):
         trainable = _count_params(self.xfeat, trainable_only=True)
         total = _count_params(self.xfeat)
         print(f"[HybridModel] XFeat → {trainable:,}/{total:,} trainable ({100 * trainable / max(total,1):.1f}%)")
+
+    def _install_xfeat_kp_hook(self, head: nn.Module) -> None:
+        """Register a forward hook on the trainable XFeat head.
+
+        The hook stores the head's output tensor in ``self._xfeat_kp_output``
+        so that ``_forward_impl`` can use it as the heatmap.  This is
+        necessary because ``raw_output['keypoints']`` might point to a
+        *different* (frozen) head inside XFeat (e.g. ``heatmap_head`` vs
+        ``keypoint_head``), which would give a tensor with
+        ``requires_grad=False`` and break the gradient path.
+        """
+        def _hook(module: nn.Module, inp: tuple, out: object) -> None:
+            # Guard against heads that return tuples/dicts rather than a
+            # plain tensor (e.g. multi-output detection heads).
+            if isinstance(out, torch.Tensor):
+                self._xfeat_kp_output = out
+            elif isinstance(out, (list, tuple)) and out and isinstance(out[0], torch.Tensor):
+                self._xfeat_kp_output = out[0]
+            # Other output types are silently ignored; _forward_impl falls
+            # back to raw_output['keypoints'] in that case.
+
+        if self._xfeat_kp_hook_handle is not None:
+            self._xfeat_kp_hook_handle.remove()
+        self._xfeat_kp_hook_handle = head.register_forward_hook(_hook)
+        print(f"[HybridModel] XFeat kp-head hook installed on {head.__class__.__name__}")
 
     # ------------------------------------------------------------------
     # Normalization
@@ -221,7 +260,7 @@ class HybridModel(nn.Module):
             # Detach for index selection; index sm (not sm_d) for values
             top_idx = s.detach().topk(K).indices     # LongTensor, no grad
             kp = yx[top_idx].flip(1).float()         # (K, 2) [x, y]
-            sc = s[top_idx]                          # (K,) — differentiable ✓
+            sc = s[top_idx].float()                  # (K,) — float32, differentiable ✓
 
             keypoints_list.append(kp)
             scores_list.append(sc)
@@ -290,8 +329,21 @@ class HybridModel(nn.Module):
 
         # XFeat stream
         xfeat_input = self._normalize_for_xfeat(image)
+
+        # Reset the hook capture before each forward so we always get the
+        # output from *this* call (not a stale tensor from a previous step).
+        self._xfeat_kp_output = None
         raw_output = self.xfeat(xfeat_input)
-        if isinstance(raw_output, dict):
+
+        # Prefer the hook-captured trainable head output when available.
+        # The hook is installed on the unfrozen kp head, so its output always
+        # has requires_grad=True.  raw_output['keypoints'] may point to a
+        # *different*, frozen head (e.g. heatmap_head), which would give a
+        # tensor with requires_grad=False — breaking the gradient path and
+        # causing RuntimeError in loss.backward().
+        if self._xfeat_kp_output is not None:
+            heatmap = self._xfeat_kp_output
+        elif isinstance(raw_output, dict):
             heatmap = raw_output['keypoints']
         elif isinstance(raw_output, (list, tuple)):
             heatmap = raw_output[0]
