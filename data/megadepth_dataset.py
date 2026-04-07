@@ -60,8 +60,12 @@ def _scale_intrinsics_to_size(
     """Scale camera intrinsics from original image size to target resize."""
     H0, W0 = orig_hw
     Ht, Wt = target_hw
-    sx = float(Wt) / float(max(W0, 1))
-    sy = float(Ht) / float(max(H0, 1))
+    if H0 <= 0 or W0 <= 0:
+        raise ValueError(
+            f"Invalid original image size for intrinsics scaling: {(H0, W0)}"
+        )
+    sx = float(Wt) / float(W0)
+    sy = float(Ht) / float(H0)
 
     K_scaled = K.astype(np.float32).copy()
     K_scaled[0, 0] *= sx

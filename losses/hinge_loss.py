@@ -362,30 +362,30 @@ class HomographyHingeLoss(nn.Module):
 
         # ── Diagnostics (detached) ────────────────────────────────────────
         with torch.no_grad():
-            n_pos = S.sum().item()
-            n_neg = float(N * M) - n_pos
+            n_pos_pairs = float(S.sum().item())
+            n_neg_pairs = float(N * M) - n_pos_pairs
             eps   = 1e-8
-            pos_sim_mean = (sim * S).sum().item()         / (n_pos + eps)
-            neg_sim_mean = (sim * (1.0 - S)).sum().item() / (n_neg + eps)
+            pos_sim_mean = (sim * S).sum().item()         / (n_pos_pairs + eps)
+            neg_sim_mean = (sim * (1.0 - S)).sum().item() / (n_neg_pairs + eps)
             stats: Dict[str, float] = {
                 'loss':          loss.item(),
                 'hinge':         hinge.item(),
                 'rep_loss':      rep.item() if self.lambda_rep > 0 else 0.0,
                 'pos_loss_mean': (
-                    pos_loss.sum().item() / max(n_pos, 1.0)
+                    pos_loss.sum().item() / max(n_pos_pairs, 1.0)
                     if self.balance_pos_neg
                     else pos_loss.sum().item() / total_pairs
                 ),
                 'neg_loss_mean': (
-                    neg_loss.sum().item() / max(n_neg, 1.0)
+                    neg_loss.sum().item() / max(n_neg_pairs, 1.0)
                     if self.balance_pos_neg
                     else neg_loss.sum().item() / total_pairs
                 ),
-                'n_pos':         n_pos,
-                'n_neg':         n_neg,
+                'n_pos':         n_pos_pairs,
+                'n_neg':         n_neg_pairs,
                 'pos_sim_mean':  pos_sim_mean,
                 'neg_sim_mean':  neg_sim_mean,
-                'pos_ratio':     n_pos / total_pairs,
+                'pos_ratio':     n_pos_pairs / total_pairs,
             }
 
         return loss, stats
