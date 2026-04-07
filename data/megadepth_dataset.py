@@ -437,7 +437,7 @@ class MegaDepthDataset(Dataset):
 
         This is exact only for a pure rotation (or scene at infinity), but
         provides a reasonable training signal for nearby image pairs.
-        For production, use depth-based correspondences directly.
+        Use depth-based correspondences (_compute_warp_field) for better accuracy.
         """
         R1 = T1[:3, :3]
         R2 = T2[:3, :3]
@@ -449,6 +449,81 @@ class MegaDepthDataset(Dataset):
 
         H = K2_t @ R21_t @ K1_inv                   # (3, 3)
         return H
+
+    @staticmethod
+    def _compute_warp_field(
+        K1:     np.ndarray,
+        K2:     np.ndarray,
+        T1:     np.ndarray,
+        T2:     np.ndarray,
+        depth1: torch.Tensor,
+        image_size: Tuple[int, int],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute a dense depth-based warp field for accurate correspondences.
+
+        For each pixel (x, y) in image-1, the warp field stores the
+        corresponding pixel (x2, y2) in image-2, computed via:
+          1. Unproject (x, y) to 3-D using depth and K₁
+          2. Transform to camera-2 frame using T₁⁻¹ and T₂
+          3. Project onto image-2 using K₂
+
+        This is exact for rigid scenes (unlike H ≈ K₂·R₂₁·K₁⁻¹ which
+        ignores translation and only holds for scenes at infinity).
+
+        Args
+        ----
+        K1, K2       : (3, 3) camera intrinsics
+        T1, T2       : (4, 4) world-to-camera extrinsics
+        depth1       : (1, H, W) depth map for image-1 (metres)
+        image_size   : (H, W) output size
+
+        Returns
+        -------
+        warp_field : (H, W, 2) float32 — (x2, y2) for each pixel of image-1
+        warp_valid : (H, W) bool       — True where depth was > 0 and
+                                         the reprojection is in front of cam-2
+        """
+        H, W = image_size
+        d = depth1[0].numpy().astype(np.float32)  # (H, W)
+
+        # Pixel grid
+        yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')  # (H, W)
+        pixels_flat = np.stack(
+            [xx.flatten(), yy.flatten(), np.ones(H * W)], axis=0
+        )  # (3, H*W)
+
+        # Unproject to camera-1 3-D
+        K1_inv = np.linalg.inv(K1.astype(np.float64))
+        rays   = K1_inv @ pixels_flat                          # (3, H*W)
+        d_flat = d.flatten()                                   # (H*W,)
+        P_cam1 = rays * d_flat[np.newaxis, :]                 # (3, H*W)
+
+        # Camera-1 → world → camera-2
+        # T is world-to-camera: P_world = T1_inv @ P_cam1_h
+        R1, t1 = T1[:3, :3].astype(np.float64), T1[:3, 3].astype(np.float64)
+        R2, t2 = T2[:3, :3].astype(np.float64), T2[:3, 3].astype(np.float64)
+
+        # P_world = R1.T @ (P_cam1 - t1)
+        P_world = R1.T @ (P_cam1 - t1[:, np.newaxis])         # (3, H*W)
+        # P_cam2 = R2 @ P_world + t2
+        P_cam2  = R2 @ P_world + t2[:, np.newaxis]            # (3, H*W)
+
+        # Project onto image-2
+        z2 = P_cam2[2]                                         # (H*W,)
+        valid_z = (z2 > 0.01) & (d_flat > 0.0)               # in front of cam-2 and has depth
+
+        proj = K2.astype(np.float64) @ (P_cam2 / np.where(valid_z, z2, 1.0)[np.newaxis, :])
+        x2 = proj[0].astype(np.float32)
+        y2 = proj[1].astype(np.float32)
+
+        warp_field = np.stack([x2, y2], axis=-1).reshape(H, W, 2)
+        warp_valid = valid_z.reshape(H, W)
+
+        return (
+            torch.from_numpy(warp_field),
+            torch.from_numpy(warp_valid),
+        )
 
     # ------------------------------------------------------------------
     # Dataset interface
@@ -466,9 +541,26 @@ class MegaDepthDataset(Dataset):
         except Exception:
             return self.__getitem__(random.randint(0, len(self) - 1))
 
-        # Compute approximate homography
+        # Compute approximate homography (always available as fallback)
         H = self._approx_homography(pair['K1'], pair['K2'],
                                      pair['T1'], pair['T2'])
+
+        # Attempt depth-based warp field for accurate correspondences.
+        # Falls back to None (use homography) if depth is unavailable.
+        warp_field: Optional[torch.Tensor] = None
+        warp_valid: Optional[torch.Tensor] = None
+        dp1 = pair.get('depth_path1')
+        if dp1 is not None and Path(dp1).exists():
+            try:
+                depth1 = self._load_depth(dp1, self.image_size)
+                warp_field, warp_valid = self._compute_warp_field(
+                    pair['K1'], pair['K2'],
+                    pair['T1'], pair['T2'],
+                    depth1, self.image_size,
+                )
+            except Exception:
+                warp_field = None
+                warp_valid = None
 
         # Photometric augmentation on image2
         if self.photo_aug is not None:
@@ -476,12 +568,16 @@ class MegaDepthDataset(Dataset):
             img2_pil = self.photo_aug(img2_pil)
             img2     = TF.to_tensor(img2_pil)
 
-        return {
-            'image1':     img1,       # (1, H, W)
-            'image2':     img2,       # (1, H, W)
-            'homography': H,          # (3, 3)
+        out: Dict[str, object] = {
+            'image1':     img1,
+            'image2':     img2,
+            'homography': H,
             'overlap':    torch.tensor(pair['overlap'], dtype=torch.float32),
         }
+        if warp_field is not None:
+            out['warp_field'] = warp_field  # (H, W, 2)
+            out['warp_valid'] = warp_valid  # (H, W) bool
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -538,11 +634,23 @@ def build_dataloader(
 
 
 def _collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
-    """Stack tensors; handle variable-size items."""
+    """Stack tensors; handle variable-size items and optional keys."""
+    # Collect all keys present in *any* sample
+    all_keys = set()
+    for b in batch:
+        all_keys.update(b.keys())
+
     out: Dict[str, object] = {}
-    for key in batch[0]:
-        vals = [b[key] for b in batch]
-        if isinstance(vals[0], torch.Tensor):
+    for key in all_keys:
+        vals = [b.get(key) for b in batch]
+
+        if all(v is None for v in vals):
+            out[key] = None
+        elif any(v is None for v in vals):
+            # Mixed: if any sample is missing this key, skip it entirely
+            # (training code will use the homography fallback)
+            out[key] = None
+        elif all(isinstance(v, torch.Tensor) for v in vals):
             out[key] = torch.stack(vals, dim=0)
         else:
             out[key] = vals

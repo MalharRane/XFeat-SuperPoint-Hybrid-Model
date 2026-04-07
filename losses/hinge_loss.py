@@ -18,24 +18,46 @@ Correspondence matrix (SuperPoint Eq. 4):
   s_{ij} = 1   if  ||H·k₁ᵢ - k₂ⱼ|| ≤ τ   (τ = correspondence threshold)
   s_{ij} = 0   otherwise
 
-Per-pair hinge loss (SuperPoint Eq. 6):
+Score-Weighted Hinge Loss
+--------------------------
+Per-pair hinge loss (extended with score weighting):
   lᵈ(dᵢ, dⱼ; sᵢⱼ) =
-      λd ·  sᵢⱼ  · max(0, mp - dᵢᵀdⱼ)    ← positive term
-    + (1 - sᵢⱼ) · max(0, dᵢᵀdⱼ - mn)     ← negative term
+      W_{ij} · [ λd · sᵢⱼ  · max(0, mp - dᵢᵀdⱼ)     ← positive term
+               + (1 - sᵢⱼ) · max(0, dᵢᵀdⱼ - mn) ]   ← negative term
+
+  W_{ij} = score₁ᵢ · score₂ⱼ  / mean(W)   (score weight matrix)
 
   mp = 1.0   positive margin (pull matching descs to cosine-sim = 1)
   mn = 0.2   negative margin (push non-matches below cosine-sim = 0.2)
   λd = 250   weighting to compensate for the pos/neg imbalance
 
-Total loss (SuperPoint Eq. 5):
-  Lᵈ = (1 / (N·M)) · Σᵢ Σⱼ lᵈ(dᵢ, dⱼ; sᵢⱼ)
+Gradient Path
+--------------
+The score weights W_{ij} are differentiable w.r.t. the XFeat heatmap:
+  ∂L/∂score₁ᵢ = (1/NM) Σⱼ [λd·s_{ij}·relu(mp-sim_{ij}) + (1-s_{ij})·relu(sim_{ij}-mn)] · score₂ⱼ
 
-Training Signal
----------------
-  • Matching pairs:     loss is non-zero when cosine-sim < 1.0
-                        → gradient pulls XFeat to detect REPEATABLE spots
-  • Non-matching pairs: loss is non-zero when cosine-sim > 0.2
-                        → gradient pushes XFeat away from AMBIGUOUS spots
+This is always ≥ 0, so gradient descent reduces scores at positions with
+poor descriptor matches — teaching XFeat to avoid non-repeatable spots.
+
+Repeatability Reward
+---------------------
+To also *increase* scores at geometrically repeatable positions:
+  L_rep = -(1/n₁) Σᵢ [has_match₁ᵢ · score₁ᵢ]
+         -(1/n₂) Σⱼ [has_match₂ⱼ · score₂ⱼ]
+
+  where has_match₁ᵢ = max_j(S_{ij}) > 0
+
+This rewards high confidence at positions that have a ground-truth
+geometric correspondence in the paired image.
+
+Combined:
+  L_total = L_hinge + λ_rep · L_rep
+
+Depth-Based Correspondences
+-----------------------------
+When a dense warp field (from depth reprojection) is provided instead of
+an approximate planar homography, correspondence labels are more accurate
+for real 3D scenes with parallax.
 
 Reference: DeTone et al., "SuperPoint", CVPRW 2018 §3.4
 """
@@ -48,33 +70,34 @@ from typing import Dict, List, Optional, Tuple, Union
 
 class HomographyHingeLoss(nn.Module):
     """
-    Hinge loss on descriptor cosine similarities with homography-induced
-    correspondence labels.
+    Score-weighted hinge loss on descriptor cosine similarities with
+    homography-induced (or depth-based) correspondence labels.
 
     Parameters
     ----------
     positive_margin : float
         mp — minimum desired cosine similarity for positive pairs.
-        Default 1.0 (matching descriptors should be identical directions).
+        Default 1.0.
 
     negative_margin : float
         mn — maximum allowed cosine similarity for negative pairs.
-        Default 0.2 (non-matching descs must be < 0.2 similar).
+        Default 0.2.
 
     lambda_d : float
-        Weighting factor for positive pairs. Necessary because the number
-        of positive pairs N_pos is much smaller than N_neg = N·M - N_pos.
-        Default 250 (from SuperPoint's published training setup).
+        Weighting factor for positive pairs. Default 250.
 
     correspondence_threshold : float
-        τ — pixel distance (in image-1 space) below which two keypoints
-        are declared corresponding after warping by H.
-        Default 8.0 px (one descriptor-cell width).
+        τ — pixel distance below which two keypoints are corresponding.
+        Default 8.0 px.
 
     safe_radius : float
-        Keypoints warped within this radius of the image border in image-2
-        are excluded from loss computation (unreliable boundary estimates).
-        Default 8.0 px.
+        Keypoints warped within this distance of the image border in
+        image-2 are excluded from the loss.  Default 8.0 px.
+
+    lambda_rep : float
+        Weight for the repeatability reward term.  Rewards high scores
+        at positions that have a geometric match in the paired image.
+        Default 0.5.  Set 0.0 to disable.
     """
 
     def __init__(
@@ -84,6 +107,7 @@ class HomographyHingeLoss(nn.Module):
         lambda_d:                  float = 250.0,
         correspondence_threshold:  float = 8.0,
         safe_radius:               float = 8.0,
+        lambda_rep:                float = 0.5,
     ):
         super().__init__()
         assert positive_margin > negative_margin, (
@@ -95,6 +119,7 @@ class HomographyHingeLoss(nn.Module):
         self.lambda_d  = lambda_d
         self.threshold = correspondence_threshold
         self.safe_r    = safe_radius
+        self.lambda_rep = lambda_rep
 
     # ------------------------------------------------------------------
     # Geometric helpers
@@ -108,8 +133,6 @@ class HomographyHingeLoss(nn.Module):
         """
         Apply a 3×3 homography to a set of 2D keypoints.
 
-        Formula: p' = π(H · [x, y, 1]ᵀ),   π([u,v,w]) = [u/w, v/w]
-
         Args
         ----
         keypoints : (N, 2)  [x, y] in pixel space
@@ -122,17 +145,11 @@ class HomographyHingeLoss(nn.Module):
         N = keypoints.shape[0]
         dtype, device = keypoints.dtype, keypoints.device
 
-        # Homogeneous coordinates (N, 3)
-        ones = torch.ones(N, 1, dtype=dtype, device=device)
-        kp_h = torch.cat([keypoints, ones], dim=1)      # (N, 3)
-
-        # Apply homography  (3×3) @ (3×N) → (3×N)
-        warped_h = (H_mat.to(dtype) @ kp_h.T)           # (3, N)
-
-        # Perspective division
-        w = warped_h[2:3].clamp(min=1e-8)               # (1, N)
-        warped = (warped_h[:2] / w).T                   # (N, 2)
-
+        ones   = torch.ones(N, 1, dtype=dtype, device=device)
+        kp_h   = torch.cat([keypoints, ones], dim=1)       # (N, 3)
+        warped_h = (H_mat.to(dtype) @ kp_h.T)              # (3, N)
+        w        = warped_h[2:3].clamp(min=1e-8)
+        warped   = (warped_h[:2] / w).T                    # (N, 2)
         return warped
 
     def _build_correspondence_matrix(
@@ -142,58 +159,79 @@ class HomographyHingeLoss(nn.Module):
         H_mat:  torch.Tensor,
         img2_hw: Optional[Tuple[int, int]] = None,
     ) -> torch.Tensor:
-        """
-        Build binary matrix S ∈ {0,1}^{N×M} where S[i,j] = 1 iff
-        k₁ᵢ and k₂ⱼ are mutual correspondences under H.
-
-        Mutual correspondence criterion
-        --------------------------------
-        Forward:  ||H·k₁ᵢ  - k₂ⱼ|| ≤ threshold
-        Backward: ||H⁻¹·k₂ⱼ - k₁ᵢ|| ≤ threshold   (optional, improves precision)
-
-        Only the forward check is used by default for efficiency. Enable
-        mutual check via ``mutual=True`` in __init__ if needed.
-
-        Args
-        ----
-        kp1      : (N, 2)  keypoints in image 1  [x, y]
-        kp2      : (M, 2)  keypoints in image 2  [x, y]
-        H_mat    : (3, 3)  H: image1 → image2
-        img2_hw  : (H, W)  image-2 dimensions for border masking (optional)
-
-        Returns
-        -------
-        S : (N, M) float tensor of binary correspondence labels
-        """
+        """Build S ∈ {0,1}^{N×M} from a planar homography."""
         N = kp1.shape[0]
-        M = kp2.shape[0]
 
-        # Warp all k₁ᵢ into image-2 space
-        kp1_in_2 = self.warp_keypoints(kp1, H_mat)     # (N, 2)
+        kp1_in_2 = self.warp_keypoints(kp1, H_mat)  # (N, 2)
 
-        # Optional: exclude warped points near image-2 border
         if img2_hw is not None:
             H2, W2 = img2_hw
             r = self.safe_r
             valid_mask = (
                 (kp1_in_2[:, 0] >= r) & (kp1_in_2[:, 0] <= W2 - r) &
                 (kp1_in_2[:, 1] >= r) & (kp1_in_2[:, 1] <= H2 - r)
-            )  # (N,) bool
+            )
         else:
             valid_mask = torch.ones(N, dtype=torch.bool, device=kp1.device)
 
-        # Pairwise L2 distances  ||H·k₁ᵢ - k₂ⱼ||
-        # (N, 1, 2) - (1, M, 2)  →  (N, M)
-        kp1_in_2_exp = kp1_in_2.unsqueeze(1)           # (N, 1, 2)
-        kp2_exp      = kp2.unsqueeze(0)                # (1, M, 2)
-        dist = torch.norm(kp1_in_2_exp - kp2_exp, dim=-1)  # (N, M)
+        dist = torch.norm(
+            kp1_in_2.unsqueeze(1) - kp2.unsqueeze(0), dim=-1
+        )  # (N, M)
+        S = (dist <= self.threshold).float()
+        S = S * valid_mask.float().unsqueeze(1)
+        return S
 
-        # Binary correspondence labels
-        S = (dist <= self.threshold).float()            # (N, M)
+    def _build_correspondence_from_warp(
+        self,
+        kp1:        torch.Tensor,
+        kp2:        torch.Tensor,
+        warp_field: torch.Tensor,
+        warp_valid: Optional[torch.Tensor] = None,
+        img2_hw:    Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
+        """
+        Build S ∈ {0,1}^{N×M} from a dense depth-based warp field.
 
-        # Zero-out rows where the warped point is outside image-2
-        S = S * valid_mask.float().unsqueeze(1)        # (N, M)
+        warp_field[y, x] = (x2, y2) — where pixel (x, y) in image-1 maps
+        to in image-2, computed via depth reprojection.  More accurate than
+        the planar approximation H ≈ K₂·R₂₁·K₁⁻¹ for real 3D scenes.
 
+        Args
+        ----
+        kp1        : (N, 2)  [x, y] keypoints in image-1
+        kp2        : (M, 2)  [x, y] keypoints in image-2
+        warp_field : (H, W, 2) dense warp (x2, y2) for each image-1 pixel
+        warp_valid : (H, W) bool, True where depth was valid
+        img2_hw    : (H2, W2) for border exclusion
+        """
+        N      = kp1.shape[0]
+        device = kp1.device
+        H_f, W_f = warp_field.shape[:2]
+
+        xi = kp1[:, 0].long().clamp(0, W_f - 1)
+        yi = kp1[:, 1].long().clamp(0, H_f - 1)
+
+        kp1_in_2 = warp_field[yi, xi]          # (N, 2)
+
+        if warp_valid is not None:
+            valid = warp_valid[yi, xi].bool()   # (N,)
+        else:
+            valid = torch.ones(N, dtype=torch.bool, device=device)
+
+        if img2_hw is not None:
+            H2, W2 = img2_hw
+            r = self.safe_r
+            border_ok = (
+                (kp1_in_2[:, 0] >= r) & (kp1_in_2[:, 0] <= W2 - r) &
+                (kp1_in_2[:, 1] >= r) & (kp1_in_2[:, 1] <= H2 - r)
+            )
+            valid = valid & border_ok
+
+        dist = torch.norm(
+            kp1_in_2.unsqueeze(1) - kp2.unsqueeze(0), dim=-1
+        )  # (N, M)
+        S = (dist <= self.threshold).float()
+        S = S * valid.float().unsqueeze(1)
         return S
 
     # ------------------------------------------------------------------
@@ -208,9 +246,13 @@ class HomographyHingeLoss(nn.Module):
         keypoints2:   torch.Tensor,
         homography:   torch.Tensor,
         image2_hw:    Optional[Tuple[int, int]] = None,
+        scores1:      Optional[torch.Tensor]    = None,
+        scores2:      Optional[torch.Tensor]    = None,
+        warp_field:   Optional[torch.Tensor]    = None,
+        warp_valid:   Optional[torch.Tensor]    = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Compute the hinge loss for one image pair.
+        Compute the score-weighted hinge loss for one image pair.
 
         Args
         ----
@@ -219,7 +261,12 @@ class HomographyHingeLoss(nn.Module):
         keypoints1   : (N, 2)    pixel-space keypoints in image 1
         keypoints2   : (M, 2)    pixel-space keypoints in image 2
         homography   : (3, 3)    H: image1 → image2
-        image2_hw    : (H, W)    image-2 size for border masking (optional)
+        image2_hw    : (H, W)    image-2 size for border masking
+        scores1      : (N,)      XFeat detection scores — enables gradient
+                                 flow to the keypoint head via score weighting
+        scores2      : (M,)      XFeat detection scores for image 2
+        warp_field   : (H, W, 2) dense depth-based warp (overrides homography)
+        warp_valid   : (H, W)    bool validity mask for warp_field
 
         Returns
         -------
@@ -235,48 +282,75 @@ class HomographyHingeLoss(nn.Module):
             dummy = torch.tensor(0.0, device=device, requires_grad=True)
             return dummy, {'loss': 0.0, 'n_pos': 0, 'n_neg': 0}
 
-        # ── Step 1: Correspondence matrix ────────────────────────────────
-        # S[i,j] = 1  iff k₁ᵢ ↔ k₂ⱼ under homography H
-        S = self._build_correspondence_matrix(
-            keypoints1, keypoints2, homography, image2_hw
-        )  # (N, M)  — no gradient needed (labels are fixed)
+        # ── Step 1: Correspondence matrix ─────────────────────────────────
+        if warp_field is not None:
+            S = self._build_correspondence_from_warp(
+                keypoints1, keypoints2, warp_field, warp_valid, image2_hw
+            )
+        else:
+            S = self._build_correspondence_matrix(
+                keypoints1, keypoints2, homography, image2_hw
+            )
         S = S.detach()
 
-        # ── Step 2: Pairwise cosine similarities ─────────────────────────
-        # Since both descriptor sets are L2-normalised:
-        #   d₁ᵢᵀd₂ⱼ  =  cosine_similarity(d₁ᵢ, d₂ⱼ)  ∈ [-1, 1]
-        sim = descriptors1 @ descriptors2.T             # (N, M)
+        # ── Step 2: Pairwise cosine similarities ──────────────────────────
+        sim = descriptors1 @ descriptors2.T   # (N, M)
 
-        # ── Step 3: Positive hinge (pull matching pairs toward sim = mp) ─
-        # l_pos[i,j] = λd · s_{ij} · max(0, mp - d₁ᵢ·d₂ⱼ)
-        pos_loss = self.lambda_d * S * F.relu(self.mp - sim)   # (N, M)
+        # ── Step 3: Score weight matrix (differentiable → kp_head) ────────
+        # W[i,j] = score1[i] * score2[j], normalised so mean(W) = 1.
+        # Gradient: ∂L/∂score1[i] = Σⱼ hinge_ij * score2[j] / NM ≥ 0
+        # → gradient descent decreases scores at positions with poor matches.
+        # Combined with the repeatability reward (below) which *increases*
+        # scores at geometrically matched positions, the model learns to
+        # select spots that are both repeatable AND discriminative.
+        if scores1 is not None and scores2 is not None:
+            W = scores1.unsqueeze(1) * scores2.unsqueeze(0)  # (N, M)
+            W = W / W.mean().clamp(min=1e-8)                 # mean-normalise
+        else:
+            W = torch.ones(N, M, device=device, dtype=sim.dtype)
 
-        # ── Step 4: Negative hinge (push non-matching below mn) ──────────
-        # l_neg[i,j] = (1 - s_{ij}) · max(0, d₁ᵢ·d₂ⱼ - mn)
-        neg_loss = (1.0 - S) * F.relu(sim - self.mn)          # (N, M)
+        # ── Step 4: Hinge terms ───────────────────────────────────────────
+        pos_loss = self.lambda_d * S       * W * F.relu(self.mp - sim)
+        neg_loss = (1.0 - S)               * W * F.relu(sim - self.mn)
 
-        # ── Step 5: Total loss (normalised over all N·M pairs) ───────────
         total_pairs = float(N * M)
-        loss = (pos_loss + neg_loss).sum() / total_pairs
+        hinge = (pos_loss + neg_loss).sum() / total_pairs
 
-        # ── Diagnostics (detached from graph) ────────────────────────────
+        # ── Step 5: Repeatability reward ──────────────────────────────────
+        # For positions that have a geometric match, reward high scores.
+        # This provides the *positive* gradient component that encourages
+        # the kp_head to score good (repeatable) locations highly.
+        rep = hinge.new_zeros(1).squeeze()
+        if scores1 is not None and scores2 is not None and self.lambda_rep > 0:
+            has_match_1 = (S.sum(dim=1) > 0).float()   # (N,) no grad needed
+            has_match_2 = (S.sum(dim=0) > 0).float()   # (M,)
+            n1 = has_match_1.sum().clamp(min=1.0)
+            n2 = has_match_2.sum().clamp(min=1.0)
+            rep = (
+                -(has_match_1 * scores1).sum() / n1
+                - (has_match_2 * scores2).sum() / n2
+            ) / 2.0
+
+        loss = hinge + self.lambda_rep * rep
+
+        # ── Diagnostics (detached) ────────────────────────────────────────
         with torch.no_grad():
-            n_pos  = S.sum().item()
-            n_neg  = (N * M) - n_pos
-
-            eps = 1e-8
+            n_pos = S.sum().item()
+            n_neg = float(N * M) - n_pos
+            eps   = 1e-8
             pos_sim_mean = (sim * S).sum().item()         / (n_pos + eps)
             neg_sim_mean = (sim * (1.0 - S)).sum().item() / (n_neg + eps)
-
             stats: Dict[str, float] = {
-                'loss':           loss.item(),
-                'pos_loss_mean':  pos_loss.sum().item() / total_pairs,
-                'neg_loss_mean':  neg_loss.sum().item() / total_pairs,
-                'n_pos':          n_pos,
-                'n_neg':          n_neg,
-                'pos_sim_mean':   pos_sim_mean,
-                'neg_sim_mean':   neg_sim_mean,
-                'pos_ratio':      n_pos / total_pairs,
+                'loss':          loss.item(),
+                'hinge':         hinge.item(),
+                'rep_loss':      rep.item() if self.lambda_rep > 0 else 0.0,
+                'pos_loss_mean': pos_loss.sum().item() / total_pairs,
+                'neg_loss_mean': neg_loss.sum().item() / total_pairs,
+                'n_pos':         n_pos,
+                'n_neg':         n_neg,
+                'pos_sim_mean':  pos_sim_mean,
+                'neg_sim_mean':  neg_sim_mean,
+                'pos_ratio':     n_pos / total_pairs,
             }
 
         return loss, stats
@@ -287,24 +361,32 @@ class HomographyHingeLoss(nn.Module):
 
     def forward_batch(
         self,
-        desc1_list:  List[torch.Tensor],
-        desc2_list:  List[torch.Tensor],
-        kp1_list:    List[torch.Tensor],
-        kp2_list:    List[torch.Tensor],
+        desc1_list:   List[torch.Tensor],
+        desc2_list:   List[torch.Tensor],
+        kp1_list:     List[torch.Tensor],
+        kp2_list:     List[torch.Tensor],
         homographies: torch.Tensor,
-        image2_hws:  Optional[List[Tuple[int, int]]] = None,
+        image2_hws:   Optional[List[Tuple[int, int]]]  = None,
+        scores1_list: Optional[List[torch.Tensor]]     = None,
+        scores2_list: Optional[List[torch.Tensor]]     = None,
+        warp_fields:  Optional[torch.Tensor]           = None,
+        warp_valids:  Optional[torch.Tensor]           = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Compute mean hinge loss across a batch of image pairs.
+        Compute mean loss across a batch of image pairs.
 
         Args
         ----
-        desc1_list   : list[Tensor(N_b, 256)]   batch of desc sets from img1
-        desc2_list   : list[Tensor(M_b, 256)]   batch of desc sets from img2
-        kp1_list     : list[Tensor(N_b, 2)]
-        kp2_list     : list[Tensor(M_b, 2)]
-        homographies : (B, 3, 3)
-        image2_hws   : optional list[(H, W)] per-image
+        desc1_list    : list[Tensor(N_b, 256)]
+        desc2_list    : list[Tensor(M_b, 256)]
+        kp1_list      : list[Tensor(N_b, 2)]
+        kp2_list      : list[Tensor(M_b, 2)]
+        homographies  : (B, 3, 3)
+        image2_hws    : optional list[(H, W)] per image
+        scores1_list  : optional list[Tensor(N_b,)]  XFeat scores for img1
+        scores2_list  : optional list[Tensor(M_b,)]  XFeat scores for img2
+        warp_fields   : optional (B, H, W, 2) depth-based warp fields
+        warp_valids   : optional (B, H, W) bool validity masks
 
         Returns
         -------
@@ -318,12 +400,18 @@ class HomographyHingeLoss(nn.Module):
         total_stats: Dict[str, float] = {}
 
         for b in range(B):
-            img2_hw = image2_hws[b] if image2_hws is not None else None
+            img2_hw = image2_hws[b]   if image2_hws   is not None else None
+            sc1     = scores1_list[b] if scores1_list  is not None else None
+            sc2     = scores2_list[b] if scores2_list  is not None else None
+            wf      = warp_fields[b]  if warp_fields   is not None else None
+            wv      = warp_valids[b]  if warp_valids   is not None else None
+
             loss_b, stats_b = self.forward(
                 desc1_list[b], desc2_list[b],
                 kp1_list[b],   kp2_list[b],
                 homographies[b],
                 img2_hw,
+                sc1, sc2, wf, wv,
             )
             total_loss = total_loss + loss_b
             for k, v in stats_b.items():
@@ -334,3 +422,4 @@ class HomographyHingeLoss(nn.Module):
         mean_stats['loss'] = mean_loss.item()
 
         return mean_loss, mean_stats
+
