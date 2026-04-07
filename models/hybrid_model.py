@@ -268,7 +268,11 @@ class HybridModel(nn.Module):
                 desc_map = self._sp_desc_map
                 if desc_map is None:
                     raise RuntimeError("SuperPoint hook returned None.")
-        return desc_map
+        # Under torch.amp.autocast the SuperPoint encoder runs in float16, but
+        # F.grid_sample (bicubic) requires input and grid to share dtype.  The
+        # grid is always float32 (derived from keypoints cast with .float()), so
+        # we cast the descriptor map to float32 here to prevent a RuntimeError.
+        return desc_map.float()
 
     # ------------------------------------------------------------------
     # Forward
