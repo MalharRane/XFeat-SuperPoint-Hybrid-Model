@@ -1,9 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import logging
 from typing import Dict, List, Tuple, Optional
 
 from .sampler import DifferentiableDescriptorSampler
+
+log = logging.getLogger(__name__)
 
 
 def _count_params(module: nn.Module, trainable_only: bool = False) -> int:
@@ -170,7 +173,7 @@ class HybridModel(nn.Module):
 
         trainable = _count_params(self.xfeat, trainable_only=True)
         total = _count_params(self.xfeat)
-        print(
+        log.info(
             "[HybridModel] Scheduled unfreeze "
             f"keywords={keywords} matched={matched_names} "
             f"new={newly_unfrozen:,} params; "

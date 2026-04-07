@@ -154,7 +154,7 @@ def _to_optional_tensor_batch(
     return None
 
 
-def _normalise_keywords(value: Any) -> Tuple[str, ...]:
+def _normalize_keywords(value: Any) -> Tuple[str, ...]:
     if value is None:
         return tuple()
     if isinstance(value, str):
@@ -221,7 +221,7 @@ def load_config(config_path: Optional[str], cli_args: argparse.Namespace) -> Dic
         if val is not None and key in cfg:
             cfg[key] = val
 
-    cfg['unfreeze_keywords'] = list(_normalise_keywords(cfg.get('unfreeze_keywords')))
+    cfg['unfreeze_keywords'] = list(_normalize_keywords(cfg.get('unfreeze_keywords')))
 
     return cfg
 
@@ -553,7 +553,8 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
 
     # ── Training Loop ───────────────────────────────────────────────────
     model.train()
-    best_loss = float('inf')
+    best_val_loss = float('inf')
+    selected_best_val_loss = float('inf')
     best_score = float('-inf')
     global_step = 0
     bad_epochs = 0
@@ -561,7 +562,7 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
     selection_metric = str(cfg.get('model_selection_metric', 'loss')).lower()
     unfreeze_epoch = cfg.get('unfreeze_at_epoch')
     unfreeze_done = False
-    unfreeze_keywords = tuple(_normalise_keywords(cfg.get('unfreeze_keywords')))
+    unfreeze_keywords = tuple(_normalize_keywords(cfg.get('unfreeze_keywords')))
 
     for epoch in range(start_epoch, cfg['max_epochs']):
         if (
@@ -638,12 +639,13 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
 
         # ReduceLROnPlateau — step on val loss
         scheduler.step(val_loss)
+        best_val_loss = min(best_val_loss, val_loss)
 
         score = _pick_model_score(selection_metric, val_stats, val_loss)
         is_best = score > best_score
         if is_best:
             best_score = score
-            best_loss = val_loss
+            selected_best_val_loss = val_loss
             bad_epochs = 0
         else:
             bad_epochs += 1
@@ -677,15 +679,16 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
 
     writer.close()
     score_label = (
-        "best_sim_gap"
+        "best_sim_gap(higher_better)"
         if selection_metric == 'sim_gap'
-        else "best_repeatability"
+        else "best_repeatability(higher_better)"
         if selection_metric == 'repeatability'
-        else "best_neg_val_loss(higher_better)"
+        else "best_loss(lower_better)"
     )
     log.info(
         "Training complete. "
-        f"Best val loss: {best_loss:.4f}  "
+        f"Best val loss overall: {best_val_loss:.4f}  "
+        f"Best-checkpoint val loss: {selected_best_val_loss:.4f}  "
         f"{score_label}={best_score:.4f}"
     )
 
