@@ -414,6 +414,15 @@ def _print_summary(title: str, metrics: Dict[str, float]) -> None:
             print(f"{k:>20s}: {metrics[k]:.4f}")
 
 
+def _release_model_memory(model: torch.nn.Module, device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    model.to("cpu")
+    del model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fixed A/B benchmark with LightGlue matching.")
     parser.add_argument("--config", type=str, default=None, help="Path to config.yaml")
@@ -487,6 +496,7 @@ def main() -> None:
         vis_dir=old_vis,
         save_vis_count=args.save_vis_count,
     )
+    _release_model_memory(old_model, device)
 
     # Rebuild loader with same seed to keep pair ordering fixed for new checkpoint.
     _set_seed(args.seed)
