@@ -415,6 +415,8 @@ def _print_summary(title: str, metrics: Dict[str, float]) -> None:
 
 
 def _release_model_memory(model: torch.nn.Module, device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
     model.to("cpu")
     del model
     if device.type == "cuda":
