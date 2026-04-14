@@ -385,7 +385,9 @@ class HybridModel(nn.Module):
         call_order = ((payload, sp_input) if likely_dict else (sp_input, payload))
         first_err = None
 
-        expected_input_errors = (TypeError, KeyError, IndexError, AttributeError)
+        # rpautrat-style forward(data) can raise IndexError when accidentally
+        # indexed with a Tensor instead of dict; keep IndexError in fallback.
+        expected_input_errors = (TypeError, KeyError, IndexError)
 
         for arg in call_order:
             try:
