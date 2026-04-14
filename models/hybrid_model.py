@@ -385,10 +385,12 @@ class HybridModel(nn.Module):
         call_order = ((payload, sp_input) if likely_dict else (sp_input, payload))
         first_err = None
 
+        expected_input_errors = (TypeError, KeyError, IndexError, AttributeError)
+
         for arg in call_order:
             try:
                 return self.superpoint(arg)
-            except Exception as err:
+            except expected_input_errors as err:
                 if first_err is None:
                     first_err = err
                 continue
