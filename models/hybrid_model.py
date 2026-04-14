@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
+import inspect
 from typing import Dict, List, Tuple, Optional
 
 from .sampler import DifferentiableDescriptorSampler
@@ -354,7 +355,7 @@ class HybridModel(nn.Module):
             else:
                 if self._sp_hook_handle is None:
                     self._install_sp_hook()
-                _ = self.superpoint(sp_input)
+                _ = self._call_superpoint_forward(sp_input)
                 desc_map = self._sp_desc_map
                 if desc_map is None:
                     raise RuntimeError("SuperPoint hook returned None.")
@@ -363,6 +364,42 @@ class HybridModel(nn.Module):
         # grid is always float32 (derived from keypoints cast with .float()), so
         # we cast the descriptor map to float32 here to prevent a RuntimeError.
         return desc_map.float()
+
+    def _call_superpoint_forward(self, sp_input: torch.Tensor):
+        """Call SuperPoint forward across API variants.
+
+        Some SuperPoint forks expect ``forward({'image': tensor})`` while
+        others expect ``forward(tensor)``. This helper tries the likely format
+        first and falls back to the other one.
+        """
+        payload = {'image': sp_input}
+
+        likely_dict = False
+        try:
+            sig = inspect.signature(self.superpoint.forward)
+            params = [n.lower() for n in sig.parameters.keys() if n != 'self']
+            likely_dict = bool(params) and params[0] in {'data', 'batch', 'inputs'}
+        except (TypeError, ValueError):
+            likely_dict = False
+
+        call_order = ((payload, sp_input) if likely_dict else (sp_input, payload))
+        first_err = None
+
+        # rpautrat-style forward(data) can raise IndexError when accidentally
+        # indexed with a Tensor instead of dict; keep IndexError in fallback.
+        expected_input_errors = (TypeError, KeyError, IndexError)
+
+        for arg in call_order:
+            try:
+                return self.superpoint(arg)
+            except expected_input_errors as err:
+                if first_err is None:
+                    first_err = err
+                continue
+
+        raise RuntimeError(
+            "SuperPoint forward failed for both tensor input and {'image': tensor} input."
+        ) from first_err
 
     # ------------------------------------------------------------------
     # Forward
