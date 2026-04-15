@@ -72,10 +72,10 @@ DEFAULT_CONFIG = {
     'mode':           'synthetic',     # 'synthetic' | 'megadepth'
     'data_root':      './data/images', # path to images or megadepth root
     'scene_info_dir': None,            # megadepth scene_info directory
-    'train_split': 'train',
-    'val_split': 'val',
-    'megadepth_val_split_ratio': 0.2,
-    'verify_dataset_pairs': True,
+    'train_split': 'train',            # megadepth split for training loader
+    'val_split': 'val',                # megadepth split for validation/eval loader
+    'megadepth_val_split_ratio': 0.2,  # used only when no train/val scene_info subdirs exist
+    'verify_dataset_pairs': True,      # preflight-check image/depth path existence
 
     # Image
     'image_height':   480,

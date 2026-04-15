@@ -377,7 +377,7 @@ class MegaDepthDataset(Dataset):
             'pairs_missing_image': 0,
             'pairs_missing_depth_files': 0,
             'pairs_no_depth_metadata': 0,
-            'pairs_incomplete_depth': 0,
+            'pairs_depth_unavailable': 0,
             'overlap_min': float('inf'),
             'overlap_max': float('-inf'),
         }
@@ -434,7 +434,7 @@ class MegaDepthDataset(Dataset):
 
         def _is_val(stem: str) -> bool:
             # Deterministic bucketing only; not for security/cryptography.
-            digest = hashlib.sha1(stem.encode('utf-8')).hexdigest()
+            digest = hashlib.md5(stem.encode('utf-8')).hexdigest()
             bucket = int(digest[:8], 16) / float(16**8 - 1)
             return bucket < self.val_split_ratio
 
@@ -507,10 +507,10 @@ class MegaDepthDataset(Dataset):
                     if self.verify_pairs and (not d1_ok or not d2_ok):
                         self.preflight_stats['pairs_missing_depth_files'] += 1
                     if not d1_ok or not d2_ok:
-                        self.preflight_stats['pairs_incomplete_depth'] += 1
+                        self.preflight_stats['pairs_depth_unavailable'] += 1
                 else:
                     self.preflight_stats['pairs_no_depth_metadata'] += 1
-                    self.preflight_stats['pairs_incomplete_depth'] += 1
+                    self.preflight_stats['pairs_depth_unavailable'] += 1
 
                 self.pairs.append({
                     'scene_id':    scene_id,
@@ -545,9 +545,9 @@ class MegaDepthDataset(Dataset):
             f"pairs_candidate={int(stats['pairs_candidate'])} "
             f"pairs_kept={int(stats['pairs_kept'])} "
             f"missing_image={int(stats['pairs_missing_image'])} "
-            f"missing_depth_files={int(stats['pairs_missing_depth_files'])} "
-            f"no_depth_metadata={int(stats['pairs_no_depth_metadata'])} "
-            f"incomplete_depth_pairs={int(stats['pairs_incomplete_depth'])} "
+            f"depth_unavailable_pairs={int(stats['pairs_depth_unavailable'])} "
+            f"(no_metadata={int(stats['pairs_no_depth_metadata'])}, "
+            f"missing_or_partial_files={int(stats['pairs_missing_depth_files'])}) "
             f"overlap_range=[{ov_min:.3f}, {ov_max:.3f}]"
         )
 
