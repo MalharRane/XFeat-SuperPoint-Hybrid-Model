@@ -435,7 +435,7 @@ class MegaDepthDataset(Dataset):
         def _is_val(stem: str) -> bool:
             # Deterministic bucketing only; not for security/cryptography.
             digest = hashlib.sha256(stem.encode('utf-8')).hexdigest()
-            bucket = int(digest[:8], 16) / float(16**8 - 1)
+            bucket = int(digest[:8], 16) / float(16**8)
             return bucket < self.val_split_ratio
 
         selected: List[Path] = []
@@ -462,11 +462,13 @@ class MegaDepthDataset(Dataset):
                 f"Scene {scene_id} has inconsistent lengths: "
                 f"N={N}, intrinsics={intrinsics.shape[0]}, poses={poses.shape[0]}"
             )
-        if depth_paths is not None and len(depth_paths) != N:
-            raise ValueError(
-                f"Scene {scene_id} has inconsistent depth_paths length: "
-                f"{len(depth_paths)} != {N}"
-            )
+        if depth_paths is not None:
+            depth_paths_arr = np.asarray(depth_paths)
+            if depth_paths_arr.ndim != 1 or depth_paths_arr.shape[0] != N:
+                raise ValueError(
+                    f"Scene {scene_id} has invalid depth_paths shape: "
+                    f"{depth_paths_arr.shape}, expected ({N},)"
+                )
         if overlap.shape[0] != N or overlap.shape[1] != N:
             raise ValueError(
                 f"Scene {scene_id} has invalid overlap_matrix shape: {overlap.shape}, expected ({N}, {N})"
@@ -545,6 +547,7 @@ class MegaDepthDataset(Dataset):
             f"pairs_kept={int(stats['pairs_kept'])} "
             f"missing_image={int(stats['pairs_missing_image'])} "
             f"pairs_depth_unavailable={int(stats['pairs_depth_unavailable'])} "
+            "(sum of no_metadata + missing_depth_files) "
             f"(no_metadata={int(stats['pairs_no_depth_metadata'])}, "
             f"missing_depth_files={int(stats['pairs_missing_depth_files'])}) "
             f"overlap_range=[{ov_min:.3f}, {ov_max:.3f}]"
