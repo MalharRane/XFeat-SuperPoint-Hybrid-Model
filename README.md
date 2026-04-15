@@ -143,10 +143,15 @@ python train.py \
 python train.py \
   --mode megadepth \
   --data_root /path/to/megadepth \
+  --scene_info_dir /path/to/megadepth/scene_info \
   --resume checkpoints/best.pth \
   --lr 1e-4 \
   --max_epochs 50
 ```
+
+> MegaDepth mode requires `scene_info/*.npz` metadata containing
+> `image_paths`, `depth_paths`, `intrinsics`, `poses`, and `overlap_matrix`.
+> Images/depth alone are not sufficient.
 
 ### One-command 2-stage training (synthetic → MegaDepth)
 ```bash
@@ -158,6 +163,13 @@ python train.py \
   --stage1_epochs 30 \
   --stage2_epochs 50
 ```
+
+### MegaDepth subset notes (e.g., scenes `0001..0015`)
+- Keep your MegaDepth root in `--data_root` (or `megadepth_data_root` in two-stage mode).
+- Point `--scene_info_dir` to matching `.npz` metadata for that subset.
+- Preferred split layout: `scene_info/train/*.npz` and `scene_info/val/*.npz`.
+- If split subfolders are missing, the loader uses a deterministic scene-level hash split via `megadepth_val_split_ratio`.
+- Loader preflight prints: selected scenes, candidate/kept pairs, missing image/depth counts, and kept overlap range.
 
 ### Accuracy-focused knobs
 - `max_pairs_per_scene`: increase MegaDepth supervision density per scene.

@@ -72,6 +72,10 @@ DEFAULT_CONFIG = {
     'mode':           'synthetic',     # 'synthetic' | 'megadepth'
     'data_root':      './data/images', # path to images or megadepth root
     'scene_info_dir': None,            # megadepth scene_info directory
+    'train_split': 'train',
+    'val_split': 'val',
+    'megadepth_val_split_ratio': 0.2,
+    'verify_dataset_pairs': True,
 
     # Image
     'image_height':   480,
@@ -532,22 +536,26 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
     # ── Data ────────────────────────────────────────────────────────────
     image_size = (cfg['image_height'], cfg['image_width'])
     train_loader = build_dataloader(
-        mode=cfg['mode'], root=cfg['data_root'],
+        mode=cfg['mode'], root=cfg['data_root'], split=cfg.get('train_split', 'train'),
         image_size=image_size, batch_size=cfg['batch_size'],
         num_workers=cfg['num_workers'], shuffle=True,
         scene_info_dir=cfg.get('scene_info_dir'),
+        val_split_ratio=cfg.get('megadepth_val_split_ratio', 0.2),
         min_overlap=cfg['min_overlap'], max_overlap=cfg['max_overlap'],
         max_pairs_per_scene=cfg.get('max_pairs_per_scene', 1000),
         augment=cfg['augment'],
+        verify_pairs=cfg.get('verify_dataset_pairs', True),
     )
     val_loader = build_dataloader(
-        mode=cfg['mode'], root=cfg['data_root'],
+        mode=cfg['mode'], root=cfg['data_root'], split=cfg.get('val_split', 'val'),
         image_size=image_size, batch_size=cfg['batch_size'],
         num_workers=cfg['num_workers'], shuffle=False,
         scene_info_dir=cfg.get('scene_info_dir'),
+        val_split_ratio=cfg.get('megadepth_val_split_ratio', 0.2),
         min_overlap=cfg['min_overlap'], max_overlap=cfg['max_overlap'],
         max_pairs_per_scene=cfg.get('max_pairs_per_scene', 1000),
         augment=False,
+        verify_pairs=cfg.get('verify_dataset_pairs', True),
     )
 
     # ── Tensorboard ─────────────────────────────────────────────────────
@@ -755,6 +763,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--mode',         type=str, choices=['synthetic', 'megadepth'],
                    help='Training data mode')
     p.add_argument('--data_root',    type=str, help='Path to training data')
+    p.add_argument('--scene_info_dir', type=str,
+                   help='MegaDepth scene_info directory containing .npz metadata')
     p.add_argument('--batch_size',   type=int, help='Batch size')
     p.add_argument('--max_epochs',   type=int, help='Number of epochs')
     p.add_argument('--lr',           type=float, help='Learning rate')
@@ -773,6 +783,16 @@ def parse_args() -> argparse.Namespace:
                    help='Positive correspondence threshold in px')
     p.add_argument('--max_pairs_per_scene', type=int,
                    help='Max MegaDepth pairs sampled per scene')
+    p.add_argument('--train_split', type=str,
+                   choices=['train', 'val'],
+                   help='MegaDepth split used for training loader')
+    p.add_argument('--val_split', type=str,
+                   choices=['train', 'val'],
+                   help='MegaDepth split used for validation loader')
+    p.add_argument('--megadepth_val_split_ratio', type=float,
+                   help='Fallback val ratio when scene_info has no train/val subfolders')
+    p.add_argument('--no_verify_dataset_pairs', action='store_true',
+                   help='Skip MegaDepth file-existence preflight checks')
     p.add_argument('--model_selection_metric', type=str,
                    choices=['loss', 'sim_gap', 'repeatability'],
                    help='Checkpoint selection metric')
@@ -803,6 +823,8 @@ if __name__ == '__main__':
 
     if args.no_amp:
         cfg['mixed_precision'] = False
+    if args.no_verify_dataset_pairs:
+        cfg['verify_dataset_pairs'] = False
 
     log.info("Config:\n" + yaml.dump(cfg, default_flow_style=False))
 

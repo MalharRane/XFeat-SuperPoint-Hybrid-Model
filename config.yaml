@@ -25,7 +25,11 @@ data_root: ./data/images  # synthetic: directory of raw images
                            # megadepth: path to MegaDepth root directory
 
 scene_info_dir: null       # megadepth only: path to scene_info/ .npz files
-                           # null → data_root/scene_info (default)
+                            # null → data_root/scene_info (default)
+train_split: train         # megadepth loader split for training
+val_split: val             # megadepth loader split for validation/eval
+megadepth_val_split_ratio: 0.2   # fallback split if scene_info has no train/val subdirs
+verify_dataset_pairs: true # preflight-check image/depth file existence and report counts
 
 # ---------------------------------------------------------------------------
 # Image configuration

@@ -35,6 +35,7 @@ fine-tuning on real MegaDepth pairs.
 import os
 import math
 import random
+import hashlib
 import h5py
 import numpy as np
 from pathlib import Path
@@ -328,18 +329,28 @@ class MegaDepthDataset(Dataset):
         root:           str,
         scene_info_dir: Optional[str] = None,
         split:          str  = 'train',
+        val_split_ratio: float = 0.2,
         image_size:     Tuple[int, int] = (480, 640),
         min_overlap:    float = 0.15,
         max_overlap:    float = 0.70,
         max_pairs_per_scene: int = 200,
         augment:        bool  = True,
+        verify_pairs:   bool  = True,
     ):
         self.root       = Path(root)
-        self.split      = split
+        self.split      = str(split).lower()
+        if self.split not in {'train', 'val'}:
+            raise ValueError(f"split must be 'train' or 'val', got '{split}'")
+        self.val_split_ratio = float(val_split_ratio)
+        if not (0.0 < self.val_split_ratio < 1.0):
+            raise ValueError(
+                f"val_split_ratio must be in (0, 1), got {self.val_split_ratio}"
+            )
         self.image_size = image_size
         self.min_ov     = min_overlap
         self.max_ov     = max_overlap
         self.max_pairs  = max_pairs_per_scene
+        self.verify_pairs = bool(verify_pairs)
 
         scene_info_dir = scene_info_dir or str(self.root / 'scene_info')
         self.scene_info_dir = Path(scene_info_dir)
@@ -356,9 +367,28 @@ class MegaDepthDataset(Dataset):
 
         # Build pair index
         self.pairs: List[Dict] = []
+        self.preflight_stats: Dict[str, float] = {
+            'num_scene_npz_total': 0,
+            'num_scene_npz_selected': 0,
+            'num_scene_npz_loaded': 0,
+            'num_scene_npz_failed': 0,
+            'pairs_candidate': 0,
+            'pairs_kept': 0,
+            'pairs_missing_image': 0,
+            'pairs_missing_depth': 0,
+            'pairs_without_depth': 0,
+            'overlap_min': float('inf'),
+            'overlap_max': float('-inf'),
+        }
         self._build_pair_index()
+        self._print_preflight_summary()
+        if len(self.pairs) == 0:
+            raise RuntimeError(
+                f"[MegaDepthDataset] split={self.split} has 0 valid pairs. "
+                "Check scene_info split coverage, path alignment, and overlap thresholds."
+            )
         print(
-            f"[MegaDepthDataset] split={split}  "
+            f"[MegaDepthDataset] split={self.split}  "
             f"{len(self.pairs):,} pairs loaded"
         )
 
@@ -375,12 +405,43 @@ class MegaDepthDataset(Dataset):
                 "Download them from the LoFTR/LightGlue release."
             )
 
-        for npz_path in npz_files:
+        self.preflight_stats['num_scene_npz_total'] = len(npz_files)
+        selected_npz = self._select_scene_files(npz_files)
+        self.preflight_stats['num_scene_npz_selected'] = len(selected_npz)
+
+        for npz_path in selected_npz:
             try:
                 info = np.load(str(npz_path), allow_pickle=True)
                 self._ingest_scene(info, npz_path.stem)
+                self.preflight_stats['num_scene_npz_loaded'] += 1
             except Exception as e:
+                self.preflight_stats['num_scene_npz_failed'] += 1
                 print(f"  [WARN] Could not load {npz_path.name}: {e}")
+
+    def _select_scene_files(self, npz_files: List[Path]) -> List[Path]:
+        """
+        Resolve scene files for split.
+        Priority:
+          1) scene_info_dir/<split>/*.npz
+          2) deterministic hash split over scene-id stems
+        """
+        split_dir = self.scene_info_dir / self.split
+        if split_dir.exists() and split_dir.is_dir():
+            split_npz = sorted(split_dir.glob('*.npz'))
+            if split_npz:
+                return split_npz
+
+        def _is_val(stem: str) -> bool:
+            digest = hashlib.sha1(stem.encode('utf-8')).hexdigest()
+            bucket = int(digest[:8], 16) / float(16**8 - 1)
+            return bucket < self.val_split_ratio
+
+        selected: List[Path] = []
+        for p in npz_files:
+            scene_is_val = _is_val(p.stem)
+            if (self.split == 'val' and scene_is_val) or (self.split == 'train' and not scene_is_val):
+                selected.append(p)
+        return selected
 
     def _ingest_scene(self, info: np.lib.npyio.NpzFile, scene_id: str) -> None:
         """Extract valid pairs from one scene .npz."""
@@ -394,6 +455,21 @@ class MegaDepthDataset(Dataset):
             return
 
         N = len(image_paths)
+        if intrinsics.shape[0] != N or poses.shape[0] != N:
+            raise ValueError(
+                f"Scene {scene_id} has inconsistent lengths: "
+                f"N={N}, intrinsics={intrinsics.shape[0]}, poses={poses.shape[0]}"
+            )
+        if depth_paths is not None and len(depth_paths) != N:
+            raise ValueError(
+                f"Scene {scene_id} has inconsistent depth_paths length: "
+                f"{len(depth_paths)} != {N}"
+            )
+        if overlap.shape[0] != N or overlap.shape[1] != N:
+            raise ValueError(
+                f"Scene {scene_id} has invalid overlap_matrix shape: {overlap.shape}, expected ({N}, {N})"
+            )
+
         count = 0
         indices = list(range(N))
         random.shuffle(indices)
@@ -408,21 +484,68 @@ class MegaDepthDataset(Dataset):
                 if not (self.min_ov <= ov <= self.max_ov):
                     continue
 
+                self.preflight_stats['pairs_candidate'] += 1
+                img1 = self.root / str(image_paths[i])
+                img2 = self.root / str(image_paths[j])
+                if self.verify_pairs and (not img1.exists() or not img2.exists()):
+                    self.preflight_stats['pairs_missing_image'] += 1
+                    continue
+
+                d1 = None
+                d2 = None
+                if depth_paths is not None:
+                    d1_abs = self.root / str(depth_paths[i])
+                    d2_abs = self.root / str(depth_paths[j])
+                    d1_ok = d1_abs.exists()
+                    d2_ok = d2_abs.exists()
+                    if d1_ok:
+                        d1 = str(d1_abs)
+                    if d2_ok:
+                        d2 = str(d2_abs)
+                    if self.verify_pairs and (not d1_ok or not d2_ok):
+                        self.preflight_stats['pairs_missing_depth'] += 1
+                    if not d1_ok:
+                        self.preflight_stats['pairs_without_depth'] += 1
+                else:
+                    self.preflight_stats['pairs_without_depth'] += 1
+
                 self.pairs.append({
                     'scene_id':    scene_id,
-                    'image_path1': str(self.root / image_paths[i]),
-                    'image_path2': str(self.root / image_paths[j]),
-                    'depth_path1': str(self.root / depth_paths[i]) if depth_paths is not None else None,
-                    'depth_path2': str(self.root / depth_paths[j]) if depth_paths is not None else None,
+                    'image_path1': str(img1),
+                    'image_path2': str(img2),
+                    'depth_path1': d1,
+                    'depth_path2': d2,
                     'K1': intrinsics[i].astype(np.float32),
                     'K2': intrinsics[j].astype(np.float32),
                     'T1': poses[i].astype(np.float32),  # world-to-cam
                     'T2': poses[j].astype(np.float32),
                     'overlap': ov,
                 })
+                self.preflight_stats['pairs_kept'] += 1
+                self.preflight_stats['overlap_min'] = min(self.preflight_stats['overlap_min'], ov)
+                self.preflight_stats['overlap_max'] = max(self.preflight_stats['overlap_max'], ov)
                 count += 1
                 if count >= self.max_pairs:
                     break
+
+    def _print_preflight_summary(self) -> None:
+        stats = self.preflight_stats
+        ov_min = stats['overlap_min'] if stats['pairs_kept'] > 0 else float('nan')
+        ov_max = stats['overlap_max'] if stats['pairs_kept'] > 0 else float('nan')
+        print(
+            "[MegaDepthDataset preflight] "
+            f"split={self.split} "
+            f"scenes_total={int(stats['num_scene_npz_total'])} "
+            f"scenes_selected={int(stats['num_scene_npz_selected'])} "
+            f"scenes_loaded={int(stats['num_scene_npz_loaded'])} "
+            f"scenes_failed={int(stats['num_scene_npz_failed'])} "
+            f"pairs_candidate={int(stats['pairs_candidate'])} "
+            f"pairs_kept={int(stats['pairs_kept'])} "
+            f"missing_image={int(stats['pairs_missing_image'])} "
+            f"missing_depth={int(stats['pairs_missing_depth'])} "
+            f"without_depth1={int(stats['pairs_without_depth'])} "
+            f"overlap_range=[{ov_min:.3f}, {ov_max:.3f}]"
+        )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -618,15 +741,18 @@ class MegaDepthDataset(Dataset):
 def build_dataloader(
     mode:              str,
     root:              str,
+    split:             str = 'train',
     image_size:        Tuple[int, int] = (480, 640),
     batch_size:        int  = 4,
     num_workers:       int  = 4,
     shuffle:           bool = True,
     scene_info_dir:    Optional[str] = None,
+    val_split_ratio:   float = 0.2,
     min_overlap:       float = 0.15,
     max_overlap:       float = 0.70,
     max_pairs_per_scene: int = 200,
     augment:           bool  = True,
+    verify_pairs:      bool  = True,
 ) -> DataLoader:
     """
     Build a DataLoader for either synthetic or MegaDepth training.
@@ -646,11 +772,14 @@ def build_dataloader(
         dataset = MegaDepthDataset(
             root=root,
             scene_info_dir=scene_info_dir,
+            split=split,
+            val_split_ratio=val_split_ratio,
             image_size=image_size,
             min_overlap=min_overlap,
             max_overlap=max_overlap,
             max_pairs_per_scene=max_pairs_per_scene,
             augment=augment,
+            verify_pairs=verify_pairs,
         )
     else:
         raise ValueError(f"mode must be 'synthetic' or 'megadepth', got '{mode}'")

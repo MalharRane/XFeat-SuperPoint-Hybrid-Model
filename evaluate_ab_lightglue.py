@@ -384,15 +384,18 @@ def _build_eval_loader(cfg: Dict, args: argparse.Namespace):
     return build_dataloader(
         mode=cfg["mode"],
         root=cfg["data_root"],
+        split=cfg.get("val_split", "val"),
         image_size=(cfg["image_height"], cfg["image_width"]),
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         shuffle=False,
         scene_info_dir=cfg.get("scene_info_dir"),
+        val_split_ratio=cfg.get("megadepth_val_split_ratio", 0.2),
         min_overlap=cfg["min_overlap"],
         max_overlap=cfg["max_overlap"],
         max_pairs_per_scene=cfg.get("max_pairs_per_scene", 1000),
         augment=False,
+        verify_pairs=cfg.get("verify_dataset_pairs", True),
     )
 
 
