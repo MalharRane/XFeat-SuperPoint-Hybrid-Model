@@ -433,7 +433,7 @@ class MegaDepthDataset(Dataset):
                 return split_npz
 
         def _is_val(stem: str) -> bool:
-            # Deterministic bucketing only; not for security/cryptography.
+            # Hash-based deterministic bucketing for reproducible splits.
             digest = hashlib.sha256(stem.encode('utf-8')).hexdigest()
             bucket = int(digest[:8], 16) / float(16**8)
             return bucket < self.val_split_ratio
@@ -547,7 +547,6 @@ class MegaDepthDataset(Dataset):
             f"pairs_kept={int(stats['pairs_kept'])} "
             f"missing_image={int(stats['pairs_missing_image'])} "
             f"pairs_depth_unavailable={int(stats['pairs_depth_unavailable'])} "
-            "(sum of no_metadata + missing_depth_files) "
             f"(no_metadata={int(stats['pairs_no_depth_metadata'])}, "
             f"missing_depth_files={int(stats['pairs_missing_depth_files'])}) "
             f"overlap_range=[{ov_min:.3f}, {ov_max:.3f}]"
