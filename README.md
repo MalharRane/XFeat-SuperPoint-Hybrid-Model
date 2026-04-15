@@ -141,23 +141,40 @@ python train.py \
 ### Phase 2 — MegaDepth Fine-tuning
 ```bash
 python train.py \
-  --mode megadepth \
+  --mode megadepth_raw \
   --data_root /path/to/megadepth \
   --resume checkpoints/best.pth \
   --lr 1e-4 \
   --max_epochs 50
 ```
 
-### One-command 2-stage training (synthetic → MegaDepth)
+> `megadepth_raw` does **not** require `.npz` metadata. It reads scene folders
+> directly (e.g. `0001/dense0/imgs`, `0001/dense0/depths`) and builds
+> same-scene training pairs on the fly.
+>
+> `megadepth` mode still requires `scene_info/*.npz` metadata containing
+> `image_paths`, `depth_paths`, `intrinsics`, `poses`, and `overlap_matrix`.
+> Use that mode when you want full LoFTR-style supervision.
+
+### One-command 2-stage training (synthetic → MegaDepth raw)
 ```bash
 python train.py \
   --config config.yaml \
   --two_stage \
   --synthetic_data_root /path/to/coco/train2017 \
   --megadepth_data_root /path/to/megadepth \
+  --stage2_mode megadepth_raw \
   --stage1_epochs 30 \
   --stage2_epochs 50
 ```
+
+### MegaDepth subset notes (e.g., scenes `0001..0015`)
+- Keep your MegaDepth root in `--data_root` (or `megadepth_data_root` in two-stage mode).
+- Prefer `--mode megadepth_raw` for raw subset layouts with `dense0/imgs` (+ optional `dense0/depths`).
+- Use `--mode megadepth` + `--scene_info_dir` only when matching `.npz` metadata is available.
+- Preferred split layout: `scene_info/train/*.npz` and `scene_info/val/*.npz`.
+- If split subfolders are missing, the loader uses a deterministic scene-level hash split via `megadepth_val_split_ratio`.
+- Loader preflight prints: selected scenes, candidate/kept pairs, missing image/depth counts, and kept overlap range.
 
 ### Accuracy-focused knobs
 - `max_pairs_per_scene`: increase MegaDepth supervision density per scene.

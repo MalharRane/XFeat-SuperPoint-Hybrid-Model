@@ -35,10 +35,12 @@ fine-tuning on real MegaDepth pairs.
 import os
 import math
 import random
+import hashlib
 import h5py
+import cv2
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -50,6 +52,21 @@ from PIL import Image
 # Minimum positive depth for a reprojected point to be considered in front
 # of the camera.  Must match the constant in losses/hinge_loss.py.
 _MIN_DEPTH_Z: float = 0.01
+_RAW_PAIR_MAX_DELTA: int = 20       # Nearby frame window for same-scene pairing.
+_RAW_ORB_NFEATURES: int = 2000      # Dense ORB keypoints for robust homography fitting.
+_RAW_LOAD_RETRIES: int = 5          # Retry budget for occasional corrupt/unreadable files.
+
+
+def _hash_bucket_is_val(stem: str, val_split_ratio: float) -> bool:
+    """
+    Deterministic scene-level split helper using SHA-256 hash bucketing.
+
+    The scene stem is hashed to a stable [0, 1) bucket value; buckets below
+    val_split_ratio are assigned to val, the rest to train.
+    """
+    digest = hashlib.sha256(stem.encode('utf-8')).hexdigest()
+    bucket = int(digest[:8], 16) / float(16**8)
+    return bucket < val_split_ratio
 
 
 def _scale_intrinsics_to_size(
@@ -328,18 +345,28 @@ class MegaDepthDataset(Dataset):
         root:           str,
         scene_info_dir: Optional[str] = None,
         split:          str  = 'train',
+        val_split_ratio: float = 0.2,
         image_size:     Tuple[int, int] = (480, 640),
         min_overlap:    float = 0.15,
         max_overlap:    float = 0.70,
         max_pairs_per_scene: int = 200,
         augment:        bool  = True,
+        verify_pairs:   bool  = True,
     ):
         self.root       = Path(root)
-        self.split      = split
+        self.split      = str(split).lower()
+        if self.split not in {'train', 'val'}:
+            raise ValueError(f"split must be 'train' or 'val', got '{split}'")
+        self.val_split_ratio = float(val_split_ratio)
+        if not (0.0 <= self.val_split_ratio <= 1.0):
+            raise ValueError(
+                f"val_split_ratio must be in [0, 1], got {self.val_split_ratio}"
+            )
         self.image_size = image_size
         self.min_ov     = min_overlap
         self.max_ov     = max_overlap
         self.max_pairs  = max_pairs_per_scene
+        self.verify_pairs = bool(verify_pairs)
 
         scene_info_dir = scene_info_dir or str(self.root / 'scene_info')
         self.scene_info_dir = Path(scene_info_dir)
@@ -356,9 +383,29 @@ class MegaDepthDataset(Dataset):
 
         # Build pair index
         self.pairs: List[Dict] = []
+        self.preflight_stats: Dict[str, float] = {
+            'num_scene_npz_total': 0,
+            'num_scene_npz_selected': 0,
+            'num_scene_npz_loaded': 0,
+            'num_scene_npz_failed': 0,
+            'pairs_candidate': 0,
+            'pairs_kept': 0,
+            'pairs_missing_image': 0,
+            'pairs_missing_depth_files': 0,
+            'pairs_no_depth_metadata': 0,
+            'pairs_depth_unavailable': 0,
+            'overlap_min': float('inf'),
+            'overlap_max': float('-inf'),
+        }
         self._build_pair_index()
+        self._print_preflight_summary()
+        if len(self.pairs) == 0:
+            raise RuntimeError(
+                f"[MegaDepthDataset] split={self.split} has 0 valid pairs. "
+                "Check scene_info split coverage, path alignment, and overlap thresholds."
+            )
         print(
-            f"[MegaDepthDataset] split={split}  "
+            f"[MegaDepthDataset] split={self.split}  "
             f"{len(self.pairs):,} pairs loaded"
         )
 
@@ -375,12 +422,38 @@ class MegaDepthDataset(Dataset):
                 "Download them from the LoFTR/LightGlue release."
             )
 
-        for npz_path in npz_files:
+        self.preflight_stats['num_scene_npz_total'] = len(npz_files)
+        selected_npz = self._select_scene_files(npz_files)
+        self.preflight_stats['num_scene_npz_selected'] = len(selected_npz)
+
+        for npz_path in selected_npz:
             try:
                 info = np.load(str(npz_path), allow_pickle=True)
                 self._ingest_scene(info, npz_path.stem)
+                self.preflight_stats['num_scene_npz_loaded'] += 1
             except Exception as e:
+                self.preflight_stats['num_scene_npz_failed'] += 1
                 print(f"  [WARN] Could not load {npz_path.name}: {e}")
+
+    def _select_scene_files(self, npz_files: List[Path]) -> List[Path]:
+        """
+        Resolve scene files for split.
+        Priority:
+          1) scene_info_dir/<split>/*.npz
+          2) deterministic hash split over scene-id stems
+        """
+        split_dir = self.scene_info_dir / self.split
+        if split_dir.exists() and split_dir.is_dir():
+            split_npz = sorted(split_dir.glob('*.npz'))
+            if split_npz:
+                return split_npz
+
+        selected: List[Path] = []
+        for p in npz_files:
+            scene_is_val = _hash_bucket_is_val(p.stem, self.val_split_ratio)
+            if (self.split == 'val' and scene_is_val) or (self.split == 'train' and not scene_is_val):
+                selected.append(p)
+        return selected
 
     def _ingest_scene(self, info: np.lib.npyio.NpzFile, scene_id: str) -> None:
         """Extract valid pairs from one scene .npz."""
@@ -394,6 +467,23 @@ class MegaDepthDataset(Dataset):
             return
 
         N = len(image_paths)
+        if intrinsics.shape[0] != N or poses.shape[0] != N:
+            raise ValueError(
+                f"Scene {scene_id} has inconsistent lengths: "
+                f"N={N}, intrinsics={intrinsics.shape[0]}, poses={poses.shape[0]}"
+            )
+        if depth_paths is not None:
+            depth_paths_arr = np.asarray(depth_paths)
+            if depth_paths_arr.ndim != 1 or depth_paths_arr.shape[0] != N:
+                raise ValueError(
+                    f"Scene {scene_id} has invalid depth_paths shape: "
+                    f"{depth_paths_arr.shape}, expected ({N},)"
+                )
+        if overlap.shape[0] != N or overlap.shape[1] != N:
+            raise ValueError(
+                f"Scene {scene_id} has invalid overlap_matrix shape: {overlap.shape}, expected ({N}, {N})"
+            )
+
         count = 0
         indices = list(range(N))
         random.shuffle(indices)
@@ -408,21 +498,69 @@ class MegaDepthDataset(Dataset):
                 if not (self.min_ov <= ov <= self.max_ov):
                     continue
 
+                self.preflight_stats['pairs_candidate'] += 1
+                img1 = self.root / str(image_paths[i])
+                img2 = self.root / str(image_paths[j])
+                if self.verify_pairs and (not img1.exists() or not img2.exists()):
+                    self.preflight_stats['pairs_missing_image'] += 1
+                    continue
+
+                d1 = None
+                d2 = None
+                if depth_paths is not None:
+                    d1_abs = self.root / str(depth_paths[i])
+                    d2_abs = self.root / str(depth_paths[j])
+                    d1_ok = d1_abs.exists()
+                    d2_ok = d2_abs.exists()
+                    if d1_ok:
+                        d1 = str(d1_abs)
+                    if d2_ok:
+                        d2 = str(d2_abs)
+                    if not d1_ok or not d2_ok:
+                        self.preflight_stats['pairs_missing_depth_files'] += 1
+                        self.preflight_stats['pairs_depth_unavailable'] += 1
+                else:
+                    self.preflight_stats['pairs_no_depth_metadata'] += 1
+                    self.preflight_stats['pairs_depth_unavailable'] += 1
+
                 self.pairs.append({
                     'scene_id':    scene_id,
-                    'image_path1': str(self.root / image_paths[i]),
-                    'image_path2': str(self.root / image_paths[j]),
-                    'depth_path1': str(self.root / depth_paths[i]) if depth_paths is not None else None,
-                    'depth_path2': str(self.root / depth_paths[j]) if depth_paths is not None else None,
+                    'image_path1': str(img1),
+                    'image_path2': str(img2),
+                    'depth_path1': d1,
+                    'depth_path2': d2,
                     'K1': intrinsics[i].astype(np.float32),
                     'K2': intrinsics[j].astype(np.float32),
                     'T1': poses[i].astype(np.float32),  # world-to-cam
                     'T2': poses[j].astype(np.float32),
                     'overlap': ov,
                 })
+                self.preflight_stats['pairs_kept'] += 1
+                self.preflight_stats['overlap_min'] = min(self.preflight_stats['overlap_min'], ov)
+                self.preflight_stats['overlap_max'] = max(self.preflight_stats['overlap_max'], ov)
                 count += 1
                 if count >= self.max_pairs:
                     break
+
+    def _print_preflight_summary(self) -> None:
+        stats = self.preflight_stats
+        ov_min = stats['overlap_min'] if stats['pairs_kept'] > 0 else float('nan')
+        ov_max = stats['overlap_max'] if stats['pairs_kept'] > 0 else float('nan')
+        print(
+            "[MegaDepthDataset preflight] "
+            f"split={self.split} "
+            f"scenes_total={int(stats['num_scene_npz_total'])} "
+            f"scenes_selected={int(stats['num_scene_npz_selected'])} "
+            f"scenes_loaded={int(stats['num_scene_npz_loaded'])} "
+            f"scenes_failed={int(stats['num_scene_npz_failed'])} "
+            f"pairs_candidate={int(stats['pairs_candidate'])} "
+            f"pairs_kept={int(stats['pairs_kept'])} "
+            f"missing_image={int(stats['pairs_missing_image'])} "
+            f"pairs_depth_unavailable={int(stats['pairs_depth_unavailable'])} "
+            f"(no_metadata={int(stats['pairs_no_depth_metadata'])}, "
+            f"missing_depth_files={int(stats['pairs_missing_depth_files'])}) "
+            f"overlap_range=[{ov_min:.3f}, {ov_max:.3f}]"
+        )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -612,29 +750,310 @@ class MegaDepthDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
+# Raw MegaDepth Dataset (no scene_info .npz required)
+# ---------------------------------------------------------------------------
+
+class MegaDepthRawDataset(Dataset):
+    """
+    MegaDepth scene-folder dataset that does not depend on scene_info .npz files.
+
+    Expected subset layout (examples):
+      root/0001/dense0/imgs/*.jpg
+      root/0001/dense0/depths/*.h5
+      root/0002/dense0/imgs/*.jpg
+      ...
+
+    Strategy:
+      1) Build same-scene image pairs with a lightweight overlap proxy.
+      2) Try to estimate a homography directly from the two images (ORB+RANSAC).
+      3) If estimation fails, fall back to synthetic homographic warping of image1.
+    """
+
+    def __init__(
+        self,
+        root: str,
+        split: str = 'train',
+        val_split_ratio: float = 0.2,
+        image_size: Tuple[int, int] = (480, 640),
+        min_overlap: float = 0.15,
+        max_overlap: float = 0.95,
+        max_pairs_per_scene: int = 200,
+        augment: bool = True,
+        verify_pairs: bool = True,
+    ):
+        self.root = Path(root)
+        self.split = str(split).lower()
+        if self.split not in {'train', 'val'}:
+            raise ValueError(f"split must be 'train' or 'val', got '{split}'")
+        self.val_split_ratio = float(val_split_ratio)
+        if not (0.0 <= self.val_split_ratio <= 1.0):
+            raise ValueError(
+                f"val_split_ratio must be in [0, 1], got {self.val_split_ratio}"
+            )
+        self.image_size = image_size
+        self.min_ov = float(min_overlap)
+        self.max_ov = float(max_overlap)
+        self.max_pairs = int(max_pairs_per_scene)
+        self.verify_pairs = bool(verify_pairs)
+
+        if augment:
+            self.photo_aug = T.Compose([
+                T.RandomApply([T.ColorJitter(brightness=0.2, contrast=0.2)], p=0.5),
+                T.RandomApply([T.GaussianBlur(kernel_size=5)], p=0.2),
+            ])
+        else:
+            self.photo_aug = None
+
+        self.pairs: List[Dict[str, Union[str, float]]] = []
+        self.preflight_stats: Dict[str, float] = {
+            'num_scene_dirs_total': 0,
+            'num_scene_dirs_selected': 0,
+            'pairs_candidate': 0,
+            'pairs_kept': 0,
+            'pairs_missing_image': 0,
+            'overlap_min': float('inf'),
+            'overlap_max': float('-inf'),
+        }
+        self._build_pair_index()
+        self._print_preflight_summary()
+        if len(self.pairs) == 0:
+            raise RuntimeError(
+                f"[MegaDepthRawDataset] split={self.split} has 0 valid pairs. "
+                "Check root layout and overlap thresholds."
+            )
+        print(
+            f"[MegaDepthRawDataset] split={self.split}  "
+            f"{len(self.pairs):,} pairs loaded"
+        )
+
+    @staticmethod
+    def _load_thumbnail(path: Path, size: int = 64) -> np.ndarray:
+        """Load grayscale thumbnail normalized to [0, 1] for overlap proxy."""
+        img = Image.open(path).convert('L').resize((size, size), Image.BILINEAR)
+        arr = np.asarray(img, dtype=np.float32) / 255.0
+        return arr
+
+    @staticmethod
+    def _overlap_proxy(a: np.ndarray, b: np.ndarray) -> float:
+        """Compute normalized cross-correlation and map it from [-1,1] to [0,1]."""
+        a0 = a - a.mean()
+        b0 = b - b.mean()
+        denom = float(np.sqrt((a0 * a0).sum() * (b0 * b0).sum()) + 1e-8)
+        corr = float((a0 * b0).sum() / denom)
+        return max(0.0, min(1.0, 0.5 * (corr + 1.0)))
+
+    def _discover_scene_img_dirs(self) -> List[Tuple[str, Path]]:
+        candidates = sorted(self.root.glob('**/dense0/imgs'))
+        out: List[Tuple[str, Path]] = []
+        for img_dir in candidates:
+            try:
+                scene_id = img_dir.parent.parent.name  # .../<scene>/dense0/imgs
+            except Exception:
+                continue
+            out.append((scene_id, img_dir))
+        return out
+
+    def _build_pair_index(self) -> None:
+        scene_dirs = self._discover_scene_img_dirs()
+        self.preflight_stats['num_scene_dirs_total'] = len(scene_dirs)
+
+        selected_scene_dirs: List[Tuple[str, Path]] = []
+        for scene_id, img_dir in scene_dirs:
+            scene_is_val = _hash_bucket_is_val(scene_id, self.val_split_ratio)
+            if (self.split == 'val' and scene_is_val) or (self.split == 'train' and not scene_is_val):
+                selected_scene_dirs.append((scene_id, img_dir))
+        self.preflight_stats['num_scene_dirs_selected'] = len(selected_scene_dirs)
+
+        exts = {'.jpg', '.jpeg', '.png', '.webp'}
+        for scene_id, img_dir in selected_scene_dirs:
+            img_paths = sorted([p for p in img_dir.glob('*') if p.suffix.lower() in exts])
+            if len(img_paths) < 2:
+                continue
+
+            thumbs: List[np.ndarray] = []
+            valid_img_paths: List[Path] = []
+            for p in img_paths:
+                if self.verify_pairs and not p.exists():
+                    continue
+                try:
+                    thumbs.append(self._load_thumbnail(p, size=64))
+                    valid_img_paths.append(p)
+                except Exception:
+                    continue
+            if len(valid_img_paths) < 2:
+                continue
+
+            n = len(valid_img_paths)
+            local_pairs: List[Tuple[int, int, float]] = []
+            # Same-scene, near-index candidates are usually more overlapping.
+            max_delta = min(_RAW_PAIR_MAX_DELTA, n - 1)
+            for i in range(n):
+                for delta in range(1, max_delta + 1):
+                    j = i + delta
+                    if j >= n:
+                        break
+                    ov = self._overlap_proxy(thumbs[i], thumbs[j])
+                    self.preflight_stats['pairs_candidate'] += 1
+                    if self.min_ov <= ov <= self.max_ov:
+                        local_pairs.append((i, j, ov))
+
+            # Fallback: if strict overlap bounds kept nothing, keep nearby pairs.
+            if not local_pairs:
+                for i in range(0, n - 1):
+                    j = min(i + 1, n - 1)
+                    if i < j:
+                        ov = self._overlap_proxy(thumbs[i], thumbs[j])
+                        local_pairs.append((i, j, ov))
+
+            random.shuffle(local_pairs)
+            local_pairs = local_pairs[: self.max_pairs]
+
+            for i, j, ov in local_pairs:
+                p1 = valid_img_paths[i]
+                p2 = valid_img_paths[j]
+                if self.verify_pairs and (not p1.exists() or not p2.exists()):
+                    self.preflight_stats['pairs_missing_image'] += 1
+                    continue
+                self.pairs.append({
+                    'scene_id': scene_id,
+                    'image_path1': str(p1),
+                    'image_path2': str(p2),
+                    'overlap': float(ov),
+                })
+                self.preflight_stats['pairs_kept'] += 1
+                self.preflight_stats['overlap_min'] = min(self.preflight_stats['overlap_min'], float(ov))
+                self.preflight_stats['overlap_max'] = max(self.preflight_stats['overlap_max'], float(ov))
+
+    def _print_preflight_summary(self) -> None:
+        stats = self.preflight_stats
+        ov_min = stats['overlap_min'] if stats['pairs_kept'] > 0 else float('nan')
+        ov_max = stats['overlap_max'] if stats['pairs_kept'] > 0 else float('nan')
+        print(
+            "[MegaDepthRawDataset preflight] "
+            f"split={self.split} "
+            f"scenes_total={int(stats['num_scene_dirs_total'])} "
+            f"scenes_selected={int(stats['num_scene_dirs_selected'])} "
+            f"pairs_candidate={int(stats['pairs_candidate'])} "
+            f"pairs_kept={int(stats['pairs_kept'])} "
+            f"missing_image={int(stats['pairs_missing_image'])} "
+            f"overlap_range=[{ov_min:.3f}, {ov_max:.3f}]"
+        )
+
+    @staticmethod
+    def _load_image(path: str, size: Tuple[int, int]) -> torch.Tensor:
+        img = Image.open(path).convert('L')
+        img = TF.resize(img, [size[0], size[1]], interpolation=T.InterpolationMode.BILINEAR)
+        return TF.to_tensor(img).float()
+
+    @staticmethod
+    def _estimate_homography_or_none(
+        img1: torch.Tensor,
+        img2: torch.Tensor,
+        min_matches: int = 40,
+        min_inliers: int = 20,
+    ) -> Optional[torch.Tensor]:
+        """
+        Estimate pair homography via ORB features + BF matching + RANSAC.
+
+        Returns None when matches/inliers are insufficient or when the
+        estimated matrix is numerically invalid/degenerate.
+        """
+        arr1 = (img1.squeeze(0).cpu().numpy() * 255.0).astype(np.uint8)
+        arr2 = (img2.squeeze(0).cpu().numpy() * 255.0).astype(np.uint8)
+
+        orb = cv2.ORB_create(nfeatures=_RAW_ORB_NFEATURES)
+        k1, d1 = orb.detectAndCompute(arr1, None)
+        k2, d2 = orb.detectAndCompute(arr2, None)
+        if d1 is None or d2 is None:
+            return None
+
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = bf.match(d1, d2)
+        if len(matches) < min_matches:
+            return None
+        matches = sorted(matches, key=lambda m: m.distance)[: min(len(matches), 500)]
+
+        pts1 = np.float32([k1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+        pts2 = np.float32([k2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+
+        H, mask = cv2.findHomography(pts1, pts2, cv2.RANSAC, 3.0)
+        if H is None or mask is None:
+            return None
+
+        inliers = int(mask.astype(np.uint8).sum())
+        if inliers < min_inliers:
+            return None
+        if not np.isfinite(H).all():
+            return None
+        if abs(float(np.linalg.det(H[:2, :2]))) < 1e-4:
+            return None
+        return torch.from_numpy(H.astype(np.float32))
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        pair = self.pairs[idx]
+        img1: Optional[torch.Tensor] = None
+        img2: Optional[torch.Tensor] = None
+        for _ in range(_RAW_LOAD_RETRIES):
+            try:
+                img1 = self._load_image(str(pair['image_path1']), self.image_size)
+                img2 = self._load_image(str(pair['image_path2']), self.image_size)
+                break
+            except (OSError, ValueError):
+                pair = self.pairs[random.randint(0, len(self) - 1)]
+        if img1 is None or img2 is None:
+            raise RuntimeError("[MegaDepthRawDataset] Failed to load image pair after retries.")
+
+        H = self._estimate_homography_or_none(img1, img2)
+
+        # Fallback to synthetic pair if geometric estimation fails.
+        if H is None:
+            Hh, Ww = self.image_size
+            H = sample_random_homography(Hh, Ww, max_angle=20.0, max_scale=0.2)
+            img2 = apply_homography_to_image(img1, H).clamp(0, 1)
+
+        if self.photo_aug is not None:
+            img2_pil = TF.to_pil_image(img2.clamp(0, 1))
+            img2_pil = self.photo_aug(img2_pil)
+            img2 = TF.to_tensor(img2_pil)
+
+        return {
+            'image1': img1,
+            'image2': img2,
+            'homography': H.float(),
+            'overlap': torch.tensor(float(pair['overlap']), dtype=torch.float32),
+        }
+
+
+# ---------------------------------------------------------------------------
 # DataLoader factory
 # ---------------------------------------------------------------------------
 
 def build_dataloader(
     mode:              str,
     root:              str,
+    split:             str = 'train',
     image_size:        Tuple[int, int] = (480, 640),
     batch_size:        int  = 4,
     num_workers:       int  = 4,
     shuffle:           bool = True,
     scene_info_dir:    Optional[str] = None,
+    val_split_ratio:   float = 0.2,
     min_overlap:       float = 0.15,
     max_overlap:       float = 0.70,
     max_pairs_per_scene: int = 200,
     augment:           bool  = True,
+    verify_pairs:      bool  = True,
 ) -> DataLoader:
     """
     Build a DataLoader for either synthetic or MegaDepth training.
 
     Parameters
     ----------
-    mode : 'synthetic' | 'megadepth'
-    root : path to images (synthetic) or megadepth_root (megadepth)
+    mode : 'synthetic' | 'megadepth' | 'megadepth_raw'
+    root : path to images (synthetic) or megadepth_root (megadepth*)
     """
     if mode == 'synthetic':
         dataset = SyntheticHomographyDataset(
@@ -646,14 +1065,31 @@ def build_dataloader(
         dataset = MegaDepthDataset(
             root=root,
             scene_info_dir=scene_info_dir,
+            split=split,
+            val_split_ratio=val_split_ratio,
             image_size=image_size,
             min_overlap=min_overlap,
             max_overlap=max_overlap,
             max_pairs_per_scene=max_pairs_per_scene,
             augment=augment,
+            verify_pairs=verify_pairs,
+        )
+    elif mode == 'megadepth_raw':
+        dataset = MegaDepthRawDataset(
+            root=root,
+            split=split,
+            val_split_ratio=val_split_ratio,
+            image_size=image_size,
+            min_overlap=min_overlap,
+            max_overlap=max_overlap,
+            max_pairs_per_scene=max_pairs_per_scene,
+            augment=augment,
+            verify_pairs=verify_pairs,
         )
     else:
-        raise ValueError(f"mode must be 'synthetic' or 'megadepth', got '{mode}'")
+        raise ValueError(
+            f"mode must be 'synthetic', 'megadepth', or 'megadepth_raw', got '{mode}'"
+        )
 
     return DataLoader(
         dataset,
