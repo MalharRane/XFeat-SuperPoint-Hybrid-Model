@@ -52,6 +52,9 @@ from PIL import Image
 # Minimum positive depth for a reprojected point to be considered in front
 # of the camera.  Must match the constant in losses/hinge_loss.py.
 _MIN_DEPTH_Z: float = 0.01
+_RAW_PAIR_MAX_DELTA: int = 20       # Nearby frame window for same-scene pairing.
+_RAW_ORB_NFEATURES: int = 2000      # Dense ORB keypoints for robust homography fitting.
+_RAW_LOAD_RETRIES: int = 5          # Retry budget for occasional corrupt/unreadable files.
 
 
 def _hash_bucket_is_val(stem: str, val_split_ratio: float) -> bool:
@@ -883,7 +886,7 @@ class MegaDepthRawDataset(Dataset):
             n = len(valid_img_paths)
             local_pairs: List[Tuple[int, int, float]] = []
             # Same-scene, near-index candidates are usually more overlapping.
-            max_delta = min(20, n - 1)
+            max_delta = min(_RAW_PAIR_MAX_DELTA, n - 1)
             for i in range(n):
                 for delta in range(1, max_delta + 1):
                     j = i + delta
@@ -958,7 +961,7 @@ class MegaDepthRawDataset(Dataset):
         arr1 = (img1.squeeze(0).cpu().numpy() * 255.0).astype(np.uint8)
         arr2 = (img2.squeeze(0).cpu().numpy() * 255.0).astype(np.uint8)
 
-        orb = cv2.ORB_create(nfeatures=2000)
+        orb = cv2.ORB_create(nfeatures=_RAW_ORB_NFEATURES)
         k1, d1 = orb.detectAndCompute(arr1, None)
         k2, d2 = orb.detectAndCompute(arr2, None)
         if d1 is None or d2 is None:
@@ -993,7 +996,7 @@ class MegaDepthRawDataset(Dataset):
         pair = self.pairs[idx]
         img1: Optional[torch.Tensor] = None
         img2: Optional[torch.Tensor] = None
-        for _ in range(5):
+        for _ in range(_RAW_LOAD_RETRIES):
             try:
                 img1 = self._load_image(str(pair['image_path1']), self.image_size)
                 img2 = self._load_image(str(pair['image_path2']), self.image_size)

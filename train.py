@@ -501,6 +501,11 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
     if cfg.get('mode') in {'megadepth', 'megadepth_raw'}:
         train_split = str(cfg.get('train_split', 'train')).lower()
         val_split = str(cfg.get('val_split', 'val')).lower()
+        if train_split == val_split:
+            raise ValueError(
+                f"Invalid split configuration: train_split and val_split are both '{train_split}'. "
+                "Use disjoint splits (train/val)."
+            )
         if train_split == 'val' and val_split == 'train':
             raise ValueError(
                 "Invalid split configuration: train_split=val and val_split=train. "
