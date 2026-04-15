@@ -55,7 +55,12 @@ _MIN_DEPTH_Z: float = 0.01
 
 
 def _hash_bucket_is_val(stem: str, val_split_ratio: float) -> bool:
-    """Deterministic scene-level split helper."""
+    """
+    Deterministic scene-level split helper using SHA-256 hash bucketing.
+
+    The scene stem is hashed to a stable [0, 1) bucket value; buckets below
+    val_split_ratio are assigned to val, the rest to train.
+    """
     digest = hashlib.sha256(stem.encode('utf-8')).hexdigest()
     bucket = int(digest[:8], 16) / float(16**8)
     return bucket < val_split_ratio
@@ -819,18 +824,15 @@ class MegaDepthRawDataset(Dataset):
         )
 
     @staticmethod
-    def _is_val_scene(scene_id: str, ratio: float) -> bool:
-        return _hash_bucket_is_val(scene_id, ratio)
-
-    @staticmethod
     def _load_thumbnail(path: Path, size: int = 64) -> np.ndarray:
+        """Load grayscale thumbnail normalized to [0, 1] for overlap proxy."""
         img = Image.open(path).convert('L').resize((size, size), Image.BILINEAR)
         arr = np.asarray(img, dtype=np.float32) / 255.0
         return arr
 
     @staticmethod
     def _overlap_proxy(a: np.ndarray, b: np.ndarray) -> float:
-        # Normalized correlation mapped to [0, 1].
+        """Compute normalized cross-correlation and map it from [-1,1] to [0,1]."""
         a0 = a - a.mean()
         b0 = b - b.mean()
         denom = float(np.sqrt((a0 * a0).sum() * (b0 * b0).sum()) + 1e-8)
@@ -854,7 +856,7 @@ class MegaDepthRawDataset(Dataset):
 
         selected_scene_dirs: List[Tuple[str, Path]] = []
         for scene_id, img_dir in scene_dirs:
-            scene_is_val = self._is_val_scene(scene_id, self.val_split_ratio)
+            scene_is_val = _hash_bucket_is_val(scene_id, self.val_split_ratio)
             if (self.split == 'val' and scene_is_val) or (self.split == 'train' and not scene_is_val):
                 selected_scene_dirs.append((scene_id, img_dir))
         self.preflight_stats['num_scene_dirs_selected'] = len(selected_scene_dirs)
@@ -947,6 +949,12 @@ class MegaDepthRawDataset(Dataset):
         min_matches: int = 40,
         min_inliers: int = 20,
     ) -> Optional[torch.Tensor]:
+        """
+        Estimate pair homography via ORB features + BF matching + RANSAC.
+
+        Returns None when matches/inliers are insufficient or when the
+        estimated matrix is numerically invalid/degenerate.
+        """
         arr1 = (img1.squeeze(0).cpu().numpy() * 255.0).astype(np.uint8)
         arr2 = (img2.squeeze(0).cpu().numpy() * 255.0).astype(np.uint8)
 
@@ -990,7 +998,7 @@ class MegaDepthRawDataset(Dataset):
                 img1 = self._load_image(str(pair['image_path1']), self.image_size)
                 img2 = self._load_image(str(pair['image_path2']), self.image_size)
                 break
-            except Exception:
+            except (OSError, ValueError):
                 pair = self.pairs[random.randint(0, len(self) - 1)]
         if img1 is None or img2 is None:
             raise RuntimeError("[MegaDepthRawDataset] Failed to load image pair after retries.")

@@ -504,7 +504,7 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
         if train_split == 'val' and val_split == 'train':
             raise ValueError(
                 "Invalid split configuration: train_split=val and val_split=train. "
-                "Use train_split=train and val_split=val (or matching values)."
+                "Use train_split=train and val_split=val."
             )
 
     # ── Device ──────────────────────────────────────────────────────────
