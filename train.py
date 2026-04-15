@@ -498,6 +498,15 @@ def load_checkpoint(
 # ---------------------------------------------------------------------------
 
 def train(cfg: Dict, resume: Optional[str] = None) -> None:
+    if cfg.get('mode') in {'megadepth', 'megadepth_raw'}:
+        train_split = str(cfg.get('train_split', 'train')).lower()
+        val_split = str(cfg.get('val_split', 'val')).lower()
+        if train_split == 'val' and val_split == 'train':
+            raise ValueError(
+                "Invalid split configuration: train_split=val and val_split=train. "
+                "Use train_split=train and val_split=val (or matching values)."
+            )
+
     # ── Device ──────────────────────────────────────────────────────────
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     log.info(f"Device: {device}")
@@ -765,7 +774,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--config',       type=str, default=None,
                    help='Path to YAML config file')
     p.add_argument('--mode',         type=str, choices=['synthetic', 'megadepth', 'megadepth_raw'],
-                    help='Training data mode')
+                   help='Training data mode')
     p.add_argument('--data_root',    type=str, help='Path to training data')
     p.add_argument('--scene_info_dir', type=str,
                    help='MegaDepth scene_info directory containing .npz metadata')
@@ -811,7 +820,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--synthetic_data_root', type=str,
                    help='Stage-1 synthetic data root')
     p.add_argument('--megadepth_data_root', type=str,
-                    help='Stage-2 MegaDepth data root')
+                   help='Stage-2 MegaDepth data root')
     p.add_argument('--stage2_mode', type=str, choices=['megadepth', 'megadepth_raw'],
                    help='Stage-2 mode for --two_stage')
     p.add_argument('--stage1_epochs', type=int, help='Stage-1 epochs')

@@ -40,7 +40,7 @@ import h5py
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -52,6 +52,13 @@ from PIL import Image
 # Minimum positive depth for a reprojected point to be considered in front
 # of the camera.  Must match the constant in losses/hinge_loss.py.
 _MIN_DEPTH_Z: float = 0.01
+
+
+def _hash_bucket_is_val(stem: str, val_split_ratio: float) -> bool:
+    """Deterministic scene-level split helper."""
+    digest = hashlib.sha256(stem.encode('utf-8')).hexdigest()
+    bucket = int(digest[:8], 16) / float(16**8)
+    return bucket < val_split_ratio
 
 
 def _scale_intrinsics_to_size(
@@ -343,9 +350,9 @@ class MegaDepthDataset(Dataset):
         if self.split not in {'train', 'val'}:
             raise ValueError(f"split must be 'train' or 'val', got '{split}'")
         self.val_split_ratio = float(val_split_ratio)
-        if not (0.0 < self.val_split_ratio < 1.0):
+        if not (0.0 <= self.val_split_ratio <= 1.0):
             raise ValueError(
-                f"val_split_ratio must be in (0, 1), got {self.val_split_ratio}"
+                f"val_split_ratio must be in [0, 1], got {self.val_split_ratio}"
             )
         self.image_size = image_size
         self.min_ov     = min_overlap
@@ -433,15 +440,9 @@ class MegaDepthDataset(Dataset):
             if split_npz:
                 return split_npz
 
-        def _is_val(stem: str) -> bool:
-            # Hash-based deterministic bucketing for reproducible splits.
-            digest = hashlib.sha256(stem.encode('utf-8')).hexdigest()
-            bucket = int(digest[:8], 16) / float(16**8)
-            return bucket < self.val_split_ratio
-
         selected: List[Path] = []
         for p in npz_files:
-            scene_is_val = _is_val(p.stem)
+            scene_is_val = _hash_bucket_is_val(p.stem, self.val_split_ratio)
             if (self.split == 'val' and scene_is_val) or (self.split == 'train' and not scene_is_val):
                 selected.append(p)
         return selected
@@ -777,9 +778,9 @@ class MegaDepthRawDataset(Dataset):
         if self.split not in {'train', 'val'}:
             raise ValueError(f"split must be 'train' or 'val', got '{split}'")
         self.val_split_ratio = float(val_split_ratio)
-        if not (0.0 < self.val_split_ratio < 1.0):
+        if not (0.0 <= self.val_split_ratio <= 1.0):
             raise ValueError(
-                f"val_split_ratio must be in (0, 1), got {self.val_split_ratio}"
+                f"val_split_ratio must be in [0, 1], got {self.val_split_ratio}"
             )
         self.image_size = image_size
         self.min_ov = float(min_overlap)
@@ -795,7 +796,7 @@ class MegaDepthRawDataset(Dataset):
         else:
             self.photo_aug = None
 
-        self.pairs: List[Dict[str, object]] = []
+        self.pairs: List[Dict[str, Union[str, float]]] = []
         self.preflight_stats: Dict[str, float] = {
             'num_scene_dirs_total': 0,
             'num_scene_dirs_selected': 0,
@@ -819,9 +820,7 @@ class MegaDepthRawDataset(Dataset):
 
     @staticmethod
     def _is_val_scene(scene_id: str, ratio: float) -> bool:
-        digest = hashlib.sha256(scene_id.encode('utf-8')).hexdigest()
-        bucket = int(digest[:8], 16) / float(16**8)
-        return bucket < ratio
+        return _hash_bucket_is_val(scene_id, ratio)
 
     @staticmethod
     def _load_thumbnail(path: Path, size: int = 64) -> np.ndarray:
@@ -984,11 +983,17 @@ class MegaDepthRawDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         pair = self.pairs[idx]
-        try:
-            img1 = self._load_image(str(pair['image_path1']), self.image_size)
-            img2 = self._load_image(str(pair['image_path2']), self.image_size)
-        except Exception:
-            return self.__getitem__(random.randint(0, len(self) - 1))
+        img1: Optional[torch.Tensor] = None
+        img2: Optional[torch.Tensor] = None
+        for _ in range(5):
+            try:
+                img1 = self._load_image(str(pair['image_path1']), self.image_size)
+                img2 = self._load_image(str(pair['image_path2']), self.image_size)
+                break
+            except Exception:
+                pair = self.pairs[random.randint(0, len(self) - 1)]
+        if img1 is None or img2 is None:
+            raise RuntimeError("[MegaDepthRawDataset] Failed to load image pair after retries.")
 
         H = self._estimate_homography_or_none(img1, img2)
 
