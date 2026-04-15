@@ -14,9 +14,10 @@
 # ---------------------------------------------------------------------------
 # Training mode
 # ---------------------------------------------------------------------------
-mode: synthetic          # 'synthetic' | 'megadepth'
-                         # synthetic  → random homographic warps (pre-training)
-                         # megadepth  → real scene pairs (fine-tuning)
+mode: synthetic          # 'synthetic' | 'megadepth' | 'megadepth_raw'
+                          # synthetic  → random homographic warps (pre-training)
+                          # megadepth  → real scene pairs via scene_info .npz (fine-tuning)
+                          # megadepth_raw → real scene folders (no .npz required)
 
 # ---------------------------------------------------------------------------
 # Data paths
@@ -25,11 +26,11 @@ data_root: ./data/images  # synthetic: directory of raw images
                            # megadepth: path to MegaDepth root directory
 
 scene_info_dir: null       # megadepth only: path to scene_info/ .npz files
-                            # null → data_root/scene_info (default)
-train_split: train         # megadepth loader split for training
-val_split: val             # megadepth loader split for validation/eval
+                             # null → data_root/scene_info (default)
+train_split: train         # megadepth* loader split for training
+val_split: val             # megadepth* loader split for validation/eval
 megadepth_val_split_ratio: 0.2   # fallback split if scene_info has no train/val subdirs
-verify_dataset_pairs: true # preflight-check image/depth file existence and report counts
+verify_dataset_pairs: true # preflight-check file existence and report counts
 
 # ---------------------------------------------------------------------------
 # Image configuration
@@ -84,7 +85,7 @@ unfreeze_at_epoch: null      # e.g. 10 to unfreeze extra XFeat modules after war
 unfreeze_keywords: []        # e.g. ['block3', 'block4']
 
 # ---------------------------------------------------------------------------
-# Data filters (megadepth mode only)
+# Data filters (megadepth / megadepth_raw modes)
 # ---------------------------------------------------------------------------
 min_overlap: 0.15            # Min covisibility score for a valid pair
 max_overlap: 0.70            # Max covisibility (trivial pairs excluded)
@@ -92,11 +93,12 @@ max_pairs_per_scene: 1000    # 1000 pairs/scene (up from previous 200) for dense
 augment:     true            # Photometric augmentation on image2
 
 # ---------------------------------------------------------------------------
-# Optional 2-stage schedule (recommended): synthetic -> megadepth
+# Optional 2-stage schedule (recommended): synthetic -> megadepth_raw
 # ---------------------------------------------------------------------------
 two_stage: false
 synthetic_data_root: null    # Required when two_stage=true and synthetic data differs
 megadepth_data_root: null    # Required when two_stage=true and MegaDepth root differs
+stage2_mode: megadepth_raw   # 'megadepth_raw' (no .npz) or 'megadepth'
 stage1_epochs: 30
 stage2_epochs: 50
 stage1_checkpoint_subdir: stage1_synthetic

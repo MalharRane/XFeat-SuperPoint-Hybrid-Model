@@ -8,11 +8,14 @@ Usage
   # Synthetic pre-training (recommended first step)
   python train.py --mode synthetic --data_root /path/to/coco/images
 
-  # MegaDepth fine-tuning
+  # MegaDepth fine-tuning (.npz scene_info)
   python train.py --mode megadepth --data_root /path/to/megadepth
 
+  # MegaDepth raw-scene fine-tuning (no .npz required)
+  python train.py --mode megadepth_raw --data_root /path/to/megadepth
+
   # Resume from checkpoint
-  python train.py --mode megadepth --data_root /path/to/megadepth \
+  python train.py --mode megadepth_raw --data_root /path/to/megadepth \
                   --resume checkpoints/best.pth
 
   # Full config override
@@ -69,11 +72,11 @@ log = logging.getLogger('train')
 
 DEFAULT_CONFIG = {
     # Training mode
-    'mode':           'synthetic',     # 'synthetic' | 'megadepth'
+    'mode':           'synthetic',     # 'synthetic' | 'megadepth' | 'megadepth_raw'
     'data_root':      './data/images', # path to images or megadepth root
-    'scene_info_dir': None,            # megadepth scene_info directory
-    'train_split': 'train',            # megadepth split for training loader
-    'val_split': 'val',                # megadepth split for validation/eval loader
+    'scene_info_dir': None,            # megadepth-only scene_info directory
+    'train_split': 'train',            # megadepth* split for training loader
+    'val_split': 'val',                # megadepth* split for validation/eval loader
     'megadepth_val_split_ratio': 0.2,  # used only when no train/val scene_info subdirs exist
     'verify_dataset_pairs': True,      # preflight-check image/depth path existence
 
@@ -129,10 +132,11 @@ DEFAULT_CONFIG = {
     'unfreeze_at_epoch': None,
     'unfreeze_keywords': [],
 
-    # Optional 2-stage schedule (synthetic -> megadepth)
+    # Optional 2-stage schedule (synthetic -> megadepth_raw by default)
     'two_stage': False,
     'synthetic_data_root': None,
     'megadepth_data_root': None,
+    'stage2_mode': 'megadepth_raw',  # 'megadepth_raw' (default) or 'megadepth'
     'stage1_epochs': 30,
     'stage2_epochs': 50,
     'stage1_checkpoint_subdir': 'stage1_synthetic',
@@ -710,7 +714,7 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
 
 def train_two_stage(cfg: Dict) -> None:
     """
-    Run synthetic pre-training then MegaDepth fine-tuning.
+    Run synthetic pre-training then stage-2 fine-tuning.
     """
     root_ckpt = Path(cfg['checkpoint_dir'])
     root_log = Path(cfg['log_dir'])
@@ -726,7 +730,7 @@ def train_two_stage(cfg: Dict) -> None:
 
     stage2_cfg = cfg.copy()
     stage2_cfg.update({
-        'mode': 'megadepth',
+        'mode': str(cfg.get('stage2_mode', 'megadepth_raw')),
         'data_root': cfg.get('megadepth_data_root') or cfg['data_root'],
         'max_epochs': int(cfg.get('stage2_epochs', 50)),
         'checkpoint_dir': str(root_ckpt / cfg.get('stage2_checkpoint_subdir', 'stage2_megadepth')),
@@ -760,8 +764,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description='Train XFeat-SuperPoint Hybrid')
     p.add_argument('--config',       type=str, default=None,
                    help='Path to YAML config file')
-    p.add_argument('--mode',         type=str, choices=['synthetic', 'megadepth'],
-                   help='Training data mode')
+    p.add_argument('--mode',         type=str, choices=['synthetic', 'megadepth', 'megadepth_raw'],
+                    help='Training data mode')
     p.add_argument('--data_root',    type=str, help='Path to training data')
     p.add_argument('--scene_info_dir', type=str,
                    help='MegaDepth scene_info directory containing .npz metadata')
@@ -807,7 +811,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--synthetic_data_root', type=str,
                    help='Stage-1 synthetic data root')
     p.add_argument('--megadepth_data_root', type=str,
-                   help='Stage-2 MegaDepth data root')
+                    help='Stage-2 MegaDepth data root')
+    p.add_argument('--stage2_mode', type=str, choices=['megadepth', 'megadepth_raw'],
+                   help='Stage-2 mode for --two_stage')
     p.add_argument('--stage1_epochs', type=int, help='Stage-1 epochs')
     p.add_argument('--stage2_epochs', type=int, help='Stage-2 epochs')
     p.add_argument('--resume',       type=str, default=None,
