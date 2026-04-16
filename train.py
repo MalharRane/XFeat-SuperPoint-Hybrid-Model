@@ -267,26 +267,41 @@ def build_model(cfg: Dict, device: torch.device) -> HybridModel:
             raise
 
     # ── SuperPoint ──────────────────────────────────────────────────────
+    def _instantiate_superpoint(cls):
+        # Handle constructor variants across SuperPoint forks/wrappers.
+        try:
+            return cls()
+        except TypeError as e:
+            msg = str(e)
+            if "required positional argument" not in msg and "unexpected keyword argument" not in msg:
+                raise
+            return cls({})
+
     try:
         from models.superpoint_core import SuperPointCore
-        superpoint = SuperPointCore()
+        superpoint = _instantiate_superpoint(SuperPointCore)
     except ImportError:
         try:
-            # Try rpautrat implementation
+            # rpautrat wrapper layout
             from superpoint.superpoint import SuperPoint as SuperPointCore
-            superpoint = SuperPointCore({})
+            superpoint = _instantiate_superpoint(SuperPointCore)
         except ImportError:
             try:
-                # Alternate import path (some setups expose SuperPoint at top-level)
-                from superpoint import SuperPoint as SuperPointCore
-                superpoint = SuperPointCore({})
+                # rpautrat PyTorch file layout (e.g. superpoint_pytorch.py)
+                from superpoint_pytorch import SuperPoint as SuperPointCore
+                superpoint = _instantiate_superpoint(SuperPointCore)
             except ImportError:
-                log.error(
-                    "Could not import SuperPointCore. "
-                    "Clone https://github.com/rpautrat/SuperPoint "
-                    "and add it to PYTHONPATH."
-                )
-                raise
+                try:
+                    # Alternate import path (some setups expose SuperPoint at top-level)
+                    from superpoint import SuperPoint as SuperPointCore
+                    superpoint = _instantiate_superpoint(SuperPointCore)
+                except ImportError:
+                    log.error(
+                        "Could not import SuperPointCore. "
+                        "Clone https://github.com/rpautrat/SuperPoint "
+                        "and add it to PYTHONPATH."
+                    )
+                    raise
 
     # Load pretrained SuperPoint weights if available
     sp_weights = Path('weights/superpoint_v1.pth')
