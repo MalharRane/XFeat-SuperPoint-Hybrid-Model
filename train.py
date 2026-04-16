@@ -271,11 +271,11 @@ def build_model(cfg: Dict, device: torch.device) -> HybridModel:
         # Handle constructor variants across SuperPoint forks/wrappers.
         try:
             return cls()
-        except TypeError:
-            try:
-                return cls({})
-            except TypeError:
-                return cls(**{})
+        except TypeError as e:
+            msg = str(e)
+            if "required positional argument" not in msg and "unexpected keyword argument" not in msg:
+                raise
+            return cls({})
 
     try:
         from models.superpoint_core import SuperPointCore
