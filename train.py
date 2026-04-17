@@ -28,6 +28,7 @@ import os
 import sys
 import time
 import argparse
+import tempfile
 import yaml
 import logging
 from pathlib import Path
@@ -37,7 +38,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
-from torch.utils.tensorboard import SummaryWriter
 
 # ---------------------------------------------------------------------------
 # Local imports — these assume XFeatCore and SuperPointCore are importable.
@@ -79,6 +79,7 @@ DEFAULT_CONFIG = {
     'val_split': 'val',                # megadepth* split for validation/eval loader
     'megadepth_val_split_ratio': 0.2,  # used only when no train/val scene_info subdirs exist
     'verify_dataset_pairs': True,      # preflight-check image/depth path existence
+    'seed': 42,
 
     # Image
     'image_height':   480,
@@ -101,7 +102,8 @@ DEFAULT_CONFIG = {
 
     # Training
     'batch_size':       4,
-    'num_workers':      4,
+    'num_workers':      0,
+    'dataloader_timeout_s': 0,
     'max_epochs':       50,
     'lr':               1e-4,
     'lr_patience':      3,       # ReduceLROnPlateau patience
@@ -236,6 +238,196 @@ def load_config(config_path: Optional[str], cli_args: argparse.Namespace) -> Dic
 
 
 # ---------------------------------------------------------------------------
+# Safety / compatibility helpers
+# ---------------------------------------------------------------------------
+
+def _runtime_error_with_stage(stage: str, exc: Exception) -> RuntimeError:
+    return RuntimeError(
+        f"\n========== Failure stage: {stage} ==========\n"
+        f"{type(exc).__name__}: {exc}\n"
+    )
+
+
+def _is_amp_runtime_error(exc: RuntimeError) -> bool:
+    msg = str(exc).lower()
+    has_amp_context = any(s in msg for s in ('amp', 'autocast', 'gradscaler', 'fp16', 'bf16'))
+    has_dtype_context = any(s in msg for s in ('float16', 'bfloat16', 'half', 'dtype'))
+    has_cuda_context = 'cuda' in msg
+    return (has_amp_context and (has_dtype_context or has_cuda_context)) or (
+        has_dtype_context and 'autocast' in msg
+    )
+
+
+def _validate_image_size(cfg: Dict) -> None:
+    h = int(cfg['image_height'])
+    w = int(cfg['image_width'])
+    if h % 8 != 0 or w % 8 != 0:
+        raise ValueError(
+            f"Invalid image size ({h}, {w}): both image_height and image_width must be divisible by 8."
+        )
+
+
+def _set_reproducible_seed(seed: int) -> None:
+    import random
+    import numpy as np
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def _summarize_state_dict_compat(module: nn.Module, state: Dict[str, Any]) -> Tuple[int, int, List[str], List[str]]:
+    current_keys = set(module.state_dict().keys())
+    incoming_keys = set(state.keys())
+    common = sorted(current_keys.intersection(incoming_keys))
+    missing = sorted(current_keys - incoming_keys)
+    unexpected = sorted(incoming_keys - current_keys)
+    return len(common), len(current_keys), missing, unexpected
+
+
+def _load_checkpoint_payload(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint file not found: {path}")
+    if path.stat().st_size <= 0:
+        raise RuntimeError(f"Checkpoint file is empty: {path}")
+    payload = torch.load(str(path), map_location='cpu')
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"Invalid checkpoint format for {path}: expected dict payload, got {type(payload).__name__}."
+        )
+    return payload
+
+
+def _atomic_torch_save(state: Dict[str, Any], output_path: Path, prefix: str) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(prefix=prefix, suffix='.pth', dir=str(output_path.parent), delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        torch.save(state, str(tmp_path))
+        os.replace(tmp_path, output_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
+def _validate_and_load_pretrained_weights(
+    module: nn.Module,
+    weight_path: Path,
+    module_name: str,
+    strict: bool = False,
+) -> None:
+    if not weight_path.exists():
+        raise FileNotFoundError(
+            f"{module_name} weights not found: {weight_path}. "
+            "Download the expected checkpoint before training."
+        )
+    if weight_path.stat().st_size <= 0:
+        raise RuntimeError(f"{module_name} weights file is empty: {weight_path}")
+
+    payload = _load_checkpoint_payload(weight_path)
+    state = payload.get('model', payload)
+    if not isinstance(state, dict):
+        raise RuntimeError(
+            f"{module_name} checkpoint payload is invalid: expected state_dict dict, got {type(state).__name__}."
+        )
+
+    common, total, missing, unexpected = _summarize_state_dict_compat(module, state)
+    if common == 0:
+        raise RuntimeError(
+            f"{module_name} checkpoint format mismatch for {weight_path}. "
+            "No overlapping parameter keys with model architecture."
+        )
+
+    missing_keys: List[str] = []
+    unexpected_keys: List[str] = []
+    if strict:
+        module.load_state_dict(state, strict=True)
+    else:
+        result = module.load_state_dict(state, strict=False)
+        missing_keys = list(result.missing_keys)
+        unexpected_keys = list(result.unexpected_keys)
+
+    policy = 'strict' if strict else 'non-strict'
+    log.info(
+        f"{module_name} weights loaded ({policy}) from {weight_path} | "
+        f"matching_keys={common}/{total} missing={len(missing_keys or missing)} unexpected={len(unexpected_keys or unexpected)}"
+    )
+    if missing_keys:
+        log.warning(f"{module_name} missing keys (sample): {missing_keys[:8]}")
+    if unexpected_keys:
+        log.warning(f"{module_name} unexpected keys (sample): {unexpected_keys[:8]}")
+
+
+def _validate_forward_output_keys_shapes(
+    out: Dict[str, Any],
+    batch_size: int,
+) -> None:
+    required = ('keypoints', 'descriptors', 'keypoints_px', 'scores')
+    missing = [k for k in required if k not in out]
+    if missing:
+        raise RuntimeError(f"forward_train output missing required keys: {missing}")
+
+    for key in required:
+        value = out[key]
+        if not isinstance(value, list):
+            raise RuntimeError(f"forward_train['{key}'] must be list, got {type(value).__name__}")
+        if len(value) != batch_size:
+            raise RuntimeError(
+                f"forward_train['{key}'] batch length mismatch: expected {batch_size}, got {len(value)}"
+            )
+
+    for b, (kp, desc, kp_px, sc) in enumerate(zip(out['keypoints'], out['descriptors'], out['keypoints_px'], out['scores'])):
+        if not isinstance(kp, torch.Tensor) or kp.dim() != 2 or kp.shape[-1] != 2:
+            raise RuntimeError(f"Sample {b}: keypoints must be (N,2) tensor.")
+        if not isinstance(desc, torch.Tensor) or desc.dim() != 2:
+            raise RuntimeError(f"Sample {b}: descriptors must be (N,D) tensor.")
+        if not isinstance(kp_px, torch.Tensor) or kp_px.dim() != 2 or kp_px.shape[-1] != 2:
+            raise RuntimeError(f"Sample {b}: keypoints_px must be (N,2) tensor.")
+        if not isinstance(sc, torch.Tensor) or sc.dim() != 1:
+            raise RuntimeError(f"Sample {b}: scores must be (N,) tensor.")
+        if kp.shape[0] != desc.shape[0] or kp.shape[0] != kp_px.shape[0] or kp.shape[0] != sc.shape[0]:
+            raise RuntimeError(f"Sample {b}: inconsistent N across keypoints/descriptors/keypoints_px/scores.")
+        if desc.dtype not in (torch.float16, torch.float32, torch.float64, torch.bfloat16):
+            raise RuntimeError(f"Sample {b}: descriptors dtype must be floating, got {desc.dtype}")
+
+
+def _run_dummy_forward_preflight(model: HybridModel, cfg: Dict, device: torch.device) -> None:
+    bsz = max(1, min(2, int(cfg.get('batch_size', 1))))
+    h = int(cfg['image_height'])
+    w = int(cfg['image_width'])
+    dummy = torch.rand((bsz, 1, h, w), device=device, dtype=torch.float32)
+    with torch.no_grad():
+        out = model.forward_train(dummy)
+    _validate_forward_output_keys_shapes(out, bsz)
+    adapter = out.get('xfeat_adapter_path', 'unknown')
+    log.info(f"Forward preflight OK | xfeat_adapter={adapter} | batch={bsz} shape=({h},{w})")
+
+
+def _validate_resume_checkpoint_payload(
+    payload: Dict[str, Any],
+    path: str,
+) -> None:
+    if 'model' not in payload or not isinstance(payload['model'], dict):
+        raise RuntimeError(
+            f"Invalid resume checkpoint {path}: missing 'model' state dict. "
+            "Suggested recovery: start fresh or provide a valid training checkpoint."
+        )
+    if 'optimizer' not in payload or not isinstance(payload['optimizer'], dict):
+        raise RuntimeError(
+            f"Invalid resume checkpoint {path}: missing 'optimizer' state. "
+            "Suggested recovery: start fresh or use a checkpoint saved by this trainer."
+        )
+    if 'epoch' not in payload:
+        raise RuntimeError(
+            f"Invalid resume checkpoint {path}: missing 'epoch' metadata. "
+            "Suggested recovery: start fresh or use a complete checkpoint."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Model factory
 # ---------------------------------------------------------------------------
 
@@ -303,23 +495,27 @@ def build_model(cfg: Dict, device: torch.device) -> HybridModel:
                     )
                     raise
 
-    # Load pretrained SuperPoint weights if available
+    # Validate/load pretrained weights (fail fast on mismatch)
     sp_weights = Path('weights/superpoint_v1.pth')
-    if sp_weights.exists():
-        state = torch.load(str(sp_weights), map_location='cpu')
-        if 'model' in state:
-            state = state['model']
-        superpoint.load_state_dict(state, strict=False)
-        log.info(f"Loaded SuperPoint weights from {sp_weights}")
+    _validate_and_load_pretrained_weights(
+        module=superpoint,
+        weight_path=sp_weights,
+        module_name='SuperPoint',
+        strict=False,
+    )
 
-    # Load pretrained XFeat weights if available
+    # Accept xfeat.pth (preferred in notebook) and xfeat.pt as fallback.
     xf_weights = Path('weights/xfeat.pth')
-    if xf_weights.exists():
-        state = torch.load(str(xf_weights), map_location='cpu')
-        if 'model' in state:
-            state = state['model']
-        xfeat.load_state_dict(state, strict=False)
-        log.info(f"Loaded XFeat weights from {xf_weights}")
+    if not xf_weights.exists():
+        alt = Path('weights/xfeat.pt')
+        if alt.exists():
+            xf_weights = alt
+    _validate_and_load_pretrained_weights(
+        module=xfeat,
+        weight_path=xf_weights,
+        module_name='XFeat',
+        strict=False,
+    )
 
     # ── Wrap in HybridModel ──────────────────────────────────────────────
     model = HybridModel(
@@ -374,31 +570,61 @@ def train_step(
 
     optimizer.zero_grad(set_to_none=True)
 
-    with autocast('cuda', enabled=cfg.get('mixed_precision', True)):
-        out1 = model.forward_train(image1)
-        out2 = model.forward_train(image2)
+    amp_enabled = bool(
+        cfg.get('mixed_precision', True)
+        and device.type == 'cuda'
+        and not cfg.get('_amp_disabled_due_to_error', False)
+    )
 
-        loss, stats = loss_fn.forward_batch(
-            desc1_list=out1['descriptors'],      # (N, 256) — correct shape
-            desc2_list=out2['descriptors'],
-            kp1_list=out1['keypoints_px'],
-            kp2_list=out2['keypoints_px'],
-            homographies=homographies,
-            image2_hws=[(image2.shape[2], image2.shape[3])] * B,
-            scores1_list=out1.get('scores'),     # enables gradient to kp_head
-            scores2_list=out2.get('scores'),
-            warp_fields=warp_fields,
-            warp_valids=warp_valids,
-        )
+    def _forward_loss(use_amp: bool):
+        with autocast('cuda', enabled=use_amp):
+            out1 = model.forward_train(image1)
+            out2 = model.forward_train(image2)
 
-    scaler.scale(loss).backward()
-    scaler.unscale_(optimizer)
+            loss_value, stats_value = loss_fn.forward_batch(
+                desc1_list=out1['descriptors'],
+                desc2_list=out2['descriptors'],
+                kp1_list=out1['keypoints_px'],
+                kp2_list=out2['keypoints_px'],
+                homographies=homographies,
+                image2_hws=[(image2.shape[2], image2.shape[3])] * B,
+                scores1_list=out1.get('scores'),
+                scores2_list=out2.get('scores'),
+                warp_fields=warp_fields,
+                warp_valids=warp_valids,
+            )
+        return loss_value, stats_value
+
+    try:
+        loss, stats = _forward_loss(amp_enabled)
+        if amp_enabled:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+        else:
+            loss.backward()
+    except RuntimeError as exc:
+        if amp_enabled and _is_amp_runtime_error(exc):
+            cfg['_amp_disabled_due_to_error'] = True
+            cfg['mixed_precision'] = False
+            log.warning(
+                "AMP runtime error detected; auto-falling back to FP32 for remaining training. "
+                f"reason={type(exc).__name__}: {exc}"
+            )
+            optimizer.zero_grad(set_to_none=True)
+            loss, stats = _forward_loss(False)
+            loss.backward()
+        else:
+            raise
+
     nn.utils.clip_grad_norm_(
         model.parameters(),
         max_norm=cfg.get('grad_clip_norm', 10.0)
     )
-    scaler.step(optimizer)
-    scaler.update()
+    if amp_enabled and not cfg.get('_amp_disabled_due_to_error', False):
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
 
     return stats
 
@@ -463,6 +689,7 @@ def validate(
 def save_checkpoint(
     model:     HybridModel,
     optimizer: optim.Optimizer,
+    scheduler: Optional[optim.lr_scheduler.ReduceLROnPlateau],
     scaler:    GradScaler,
     epoch:     int,
     loss:      float,
@@ -480,14 +707,16 @@ def save_checkpoint(
         'optimizer':   optimizer.state_dict(),
         'scaler':      scaler.state_dict(),
     }
+    if scheduler is not None:
+        state['scheduler'] = scheduler.state_dict()
 
     path = ckpt_dir / f'epoch_{epoch:04d}.pth'
-    torch.save(state, str(path))
+    _atomic_torch_save(state, path, prefix='ckpt_')
     log.info(f"  Saved checkpoint → {path}")
 
     if is_best:
         best_path = ckpt_dir / 'best.pth'
-        torch.save(state, str(best_path))
+        _atomic_torch_save(state, best_path, prefix='ckpt_best_')
         log.info(f"  ★ New best → {best_path}")
 
 
@@ -495,14 +724,27 @@ def load_checkpoint(
     path:      str,
     model:     HybridModel,
     optimizer: optim.Optimizer,
+    scheduler: optim.lr_scheduler.ReduceLROnPlateau,
     scaler:    GradScaler,
     device:    torch.device,
+    require_scheduler_state: bool = True,
 ) -> int:
     """Load checkpoint, return start epoch."""
     state = torch.load(path, map_location=device)
+    _validate_resume_checkpoint_payload(state, path)
     model.load_state_dict(state['model'])
     optimizer.load_state_dict(state['optimizer'])
-    scaler.load_state_dict(state['scaler'])
+    if 'scheduler' in state and isinstance(state['scheduler'], dict):
+        scheduler.load_state_dict(state['scheduler'])
+    elif require_scheduler_state:
+        raise RuntimeError(
+            f"Invalid resume checkpoint {path}: missing 'scheduler' state. "
+            "Suggested recovery: start fresh or resume from a full training checkpoint."
+        )
+    else:
+        log.warning("Resume checkpoint has no scheduler state; continuing with fresh scheduler state.")
+    if 'scaler' in state and isinstance(state['scaler'], dict):
+        scaler.load_state_dict(state['scaler'])
     epoch = state['epoch'] + 1
     log.info(f"Resumed from {path}  (epoch {epoch})")
     return epoch
@@ -513,6 +755,8 @@ def load_checkpoint(
 # ---------------------------------------------------------------------------
 
 def train(cfg: Dict, resume: Optional[str] = None) -> None:
+    # TensorBoard's transitive deps can trigger TensorFlow plugin logs in some runtimes.
+    os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
     if cfg.get('mode') in {'megadepth', 'megadepth_raw'}:
         train_split = str(cfg.get('train_split', 'train')).lower()
         val_split = str(cfg.get('val_split', 'val')).lower()
@@ -526,78 +770,123 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
                 "Invalid split configuration: train_split=val and val_split=train. "
                 "Use train_split=train and val_split=val."
             )
+    _validate_image_size(cfg)
+    _set_reproducible_seed(int(cfg.get('seed', 42)))
+    is_colab = bool(os.environ.get('COLAB_GPU')) or ('google.colab' in sys.modules)
+    if is_colab and int(cfg.get('num_workers', 0)) > 0:
+        log.warning(
+            "Colab runtime detected: using num_workers=0 safe default. "
+            "You can test 2/4 workers after confirming stability."
+        )
+        cfg['num_workers'] = 0
 
     # ── Device ──────────────────────────────────────────────────────────
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    log.info(f"Device: {device}")
+    try:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        log.info(f"Device: {device}")
+    except Exception as exc:
+        raise _runtime_error_with_stage('setup/device', exc) from exc
 
     # ── Model ───────────────────────────────────────────────────────────
-    model = build_model(cfg, device)
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log.info(f"Trainable parameters: {trainable:,}")
+    try:
+        model = build_model(cfg, device)
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        log.info(f"Trainable parameters: {trainable:,}")
+    except Exception as exc:
+        raise _runtime_error_with_stage('model init', exc) from exc
 
     # ── Loss ────────────────────────────────────────────────────────────
-    loss_fn = HomographyHingeLoss(
-        positive_margin=cfg['positive_margin'],
-        negative_margin=cfg['negative_margin'],
-        lambda_d=cfg['lambda_d'],
-        lambda_rep=cfg.get('lambda_rep', 0.5),
-        correspondence_threshold=cfg['correspondence_threshold'],
-        safe_radius=cfg.get('safe_radius', 8.0),
-        balance_pos_neg=cfg.get('balance_pos_neg', True),
-    )
+    try:
+        loss_fn = HomographyHingeLoss(
+            positive_margin=cfg['positive_margin'],
+            negative_margin=cfg['negative_margin'],
+            lambda_d=cfg['lambda_d'],
+            lambda_rep=cfg.get('lambda_rep', 0.5),
+            correspondence_threshold=cfg['correspondence_threshold'],
+            safe_radius=cfg.get('safe_radius', 8.0),
+            balance_pos_neg=cfg.get('balance_pos_neg', True),
+        )
+    except Exception as exc:
+        raise _runtime_error_with_stage('loss init', exc) from exc
 
     # ── Optimizer + Scheduler ────────────────────────────────────────────
-    optimizer = optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=cfg['lr'],
-        weight_decay=cfg['weight_decay'],
-    )
-    # ReduceLROnPlateau adjusts lr based on val loss — more adaptive than
-    # a fixed milestone schedule and works well when early stopping is used.
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=cfg.get('lr_factor', 0.5),
-        patience=cfg.get('lr_patience', 5),
-        threshold=cfg.get('lr_threshold', 1e-4),
-        cooldown=cfg.get('lr_cooldown', 0),
-        min_lr=cfg.get('min_lr', 1e-6),
-    )
-    scaler = GradScaler('cuda', enabled=cfg.get('mixed_precision', True))
+    try:
+        optimizer = optim.Adam(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=cfg['lr'],
+            weight_decay=cfg['weight_decay'],
+        )
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=cfg.get('lr_factor', 0.5),
+            patience=cfg.get('lr_patience', 5),
+            threshold=cfg.get('lr_threshold', 1e-4),
+            cooldown=cfg.get('lr_cooldown', 0),
+            min_lr=cfg.get('min_lr', 1e-6),
+        )
+        amp_enabled = bool(cfg.get('mixed_precision', True) and device.type == 'cuda')
+        scaler = GradScaler('cuda', enabled=amp_enabled)
+    except Exception as exc:
+        raise _runtime_error_with_stage('optimizer/scheduler init', exc) from exc
 
     # ── Data ────────────────────────────────────────────────────────────
-    image_size = (cfg['image_height'], cfg['image_width'])
-    train_loader = build_dataloader(
-        mode=cfg['mode'], root=cfg['data_root'], split=cfg.get('train_split', 'train'),
-        image_size=image_size, batch_size=cfg['batch_size'],
-        num_workers=cfg['num_workers'], shuffle=True,
-        scene_info_dir=cfg.get('scene_info_dir'),
-        val_split_ratio=cfg.get('megadepth_val_split_ratio', 0.2),
-        min_overlap=cfg['min_overlap'], max_overlap=cfg['max_overlap'],
-        max_pairs_per_scene=cfg.get('max_pairs_per_scene', 1000),
-        augment=cfg['augment'],
-        verify_pairs=cfg.get('verify_dataset_pairs', True),
-    )
-    val_loader = build_dataloader(
-        mode=cfg['mode'], root=cfg['data_root'], split=cfg.get('val_split', 'val'),
-        image_size=image_size, batch_size=cfg['batch_size'],
-        num_workers=cfg['num_workers'], shuffle=False,
-        scene_info_dir=cfg.get('scene_info_dir'),
-        val_split_ratio=cfg.get('megadepth_val_split_ratio', 0.2),
-        min_overlap=cfg['min_overlap'], max_overlap=cfg['max_overlap'],
-        max_pairs_per_scene=cfg.get('max_pairs_per_scene', 1000),
-        augment=False,
-        verify_pairs=cfg.get('verify_dataset_pairs', True),
-    )
+    try:
+        image_size = (cfg['image_height'], cfg['image_width'])
+        train_loader = build_dataloader(
+            mode=cfg['mode'], root=cfg['data_root'], split=cfg.get('train_split', 'train'),
+            image_size=image_size, batch_size=cfg['batch_size'],
+            num_workers=cfg['num_workers'], shuffle=True,
+            scene_info_dir=cfg.get('scene_info_dir'),
+            val_split_ratio=cfg.get('megadepth_val_split_ratio', 0.2),
+            min_overlap=cfg['min_overlap'], max_overlap=cfg['max_overlap'],
+            max_pairs_per_scene=cfg.get('max_pairs_per_scene', 1000),
+            augment=cfg['augment'],
+            verify_pairs=cfg.get('verify_dataset_pairs', True),
+            timeout_s=int(cfg.get('dataloader_timeout_s', 0)),
+        )
+        val_loader = build_dataloader(
+            mode=cfg['mode'], root=cfg['data_root'], split=cfg.get('val_split', 'val'),
+            image_size=image_size, batch_size=cfg['batch_size'],
+            num_workers=cfg['num_workers'], shuffle=False,
+            scene_info_dir=cfg.get('scene_info_dir'),
+            val_split_ratio=cfg.get('megadepth_val_split_ratio', 0.2),
+            min_overlap=cfg['min_overlap'], max_overlap=cfg['max_overlap'],
+            max_pairs_per_scene=cfg.get('max_pairs_per_scene', 1000),
+            augment=False,
+            verify_pairs=cfg.get('verify_dataset_pairs', True),
+            timeout_s=int(cfg.get('dataloader_timeout_s', 0)),
+        )
+    except Exception as exc:
+        raise _runtime_error_with_stage('dataloaders', exc) from exc
+
+    # ── Forward preflight ────────────────────────────────────────────────
+    try:
+        _run_dummy_forward_preflight(model, cfg, device)
+        first_batch = next(iter(train_loader))
+        with torch.no_grad():
+            out1 = model.forward_train(first_batch['image1'].to(device))
+            out2 = model.forward_train(first_batch['image2'].to(device))
+        _validate_forward_output_keys_shapes(out1, first_batch['image1'].shape[0])
+        _validate_forward_output_keys_shapes(out2, first_batch['image2'].shape[0])
+        log.info("First-batch preflight step OK.")
+    except Exception as exc:
+        raise _runtime_error_with_stage('first batch forward/preflight', exc) from exc
 
     # ── Tensorboard ─────────────────────────────────────────────────────
-    writer = SummaryWriter(log_dir=cfg['log_dir'])
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(log_dir=cfg['log_dir'])
+    except Exception as exc:
+        raise _runtime_error_with_stage('logging/tensorboard init', exc) from exc
 
     # ── Resume ──────────────────────────────────────────────────────────
     start_epoch = 0
     if resume:
-        start_epoch = load_checkpoint(resume, model, optimizer, scaler, device)
+        try:
+            start_epoch = load_checkpoint(resume, model, optimizer, scheduler, scaler, device)
+        except Exception as exc:
+            raise _runtime_error_with_stage('resume checkpoint load', exc) from exc
 
     # ── Training Loop ───────────────────────────────────────────────────
     model.train()
@@ -637,29 +926,41 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
         epoch_stats: Dict[str, float] = {}
         t0 = time.time()
 
-        for batch_idx, batch in enumerate(train_loader):
-            stats = train_step(
-                model, batch, loss_fn, optimizer, scaler, cfg, device
-            )
-            global_step += 1
-
-            # Accumulate epoch stats
-            for k, v in stats.items():
-                epoch_stats[k] = epoch_stats.get(k, 0.0) + v
-
-            # Logging (every 50 steps)
-            if batch_idx % 50 == 0:
-                lr = optimizer.param_groups[0]['lr']
-                log.info(
-                    f"E{epoch:03d} [{batch_idx:04d}/{len(train_loader):04d}]  "
-                    f"loss={stats.get('loss', 0):.4f}  "
-                    f"hinge={stats.get('hinge', 0):.4f}  "
-                    f"pos_sim={stats.get('pos_sim_mean', 0):.3f}  "
-                    f"neg_sim={stats.get('neg_sim_mean', 0):.3f}  "
-                    f"lr={lr:.2e}"
+        try:
+            for batch_idx, batch in enumerate(train_loader):
+                stats = train_step(
+                    model, batch, loss_fn, optimizer, scaler, cfg, device
                 )
+                global_step += 1
+
+                # Accumulate epoch stats
                 for k, v in stats.items():
-                    writer.add_scalar(f'train_step/{k}', v, global_step)
+                    epoch_stats[k] = epoch_stats.get(k, 0.0) + v
+
+                # Logging (every 50 steps)
+                if batch_idx % 50 == 0:
+                    lr = optimizer.param_groups[0]['lr']
+                    log.info(
+                        f"E{epoch:03d} [{batch_idx:04d}/{len(train_loader):04d}]  "
+                        f"loss={stats.get('loss', 0):.4f}  "
+                        f"hinge={stats.get('hinge', 0):.4f}  "
+                        f"pos_sim={stats.get('pos_sim_mean', 0):.3f}  "
+                        f"neg_sim={stats.get('neg_sim_mean', 0):.3f}  "
+                        f"lr={lr:.2e}"
+                    )
+                    for k, v in stats.items():
+                        writer.add_scalar(f'train_step/{k}', v, global_step)
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            if 'dataloader worker' in msg or 'worker exited unexpectedly' in msg or 'timed out' in msg:
+                raise _runtime_error_with_stage(
+                    'training loop/dataloader',
+                    RuntimeError(
+                        f"{exc}\nHint: set num_workers=0 on Colab, then test 2 or 4 only if stable. "
+                        "If using workers, increase dataloader_timeout_s."
+                    ),
+                ) from exc
+            raise _runtime_error_with_stage('training loop', exc) from exc
 
         # Epoch averages
         n_batches = max(len(train_loader), 1)
@@ -714,7 +1015,7 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
 
         if (epoch + 1) % cfg['save_every'] == 0 or is_best:
             save_checkpoint(
-                model, optimizer, scaler, epoch, val_loss, cfg, is_best
+                model, optimizer, scheduler, scaler, epoch, val_loss, cfg, is_best
             )
 
         # Early stopping
@@ -799,6 +1100,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--scene_info_dir', type=str,
                    help='MegaDepth scene_info directory containing .npz metadata')
     p.add_argument('--batch_size',   type=int, help='Batch size')
+    p.add_argument('--num_workers',  type=int, help='DataLoader workers (Colab-safe default: 0)')
+    p.add_argument('--dataloader_timeout_s', type=int,
+                   help='DataLoader timeout in seconds (used only when num_workers > 0)')
     p.add_argument('--max_epochs',   type=int, help='Number of epochs')
     p.add_argument('--lr',           type=float, help='Learning rate')
     p.add_argument('--lr_patience',  type=int, help='ReduceLROnPlateau patience')
@@ -845,6 +1149,7 @@ def parse_args() -> argparse.Namespace:
                    help='Stage-2 mode for --two_stage')
     p.add_argument('--stage1_epochs', type=int, help='Stage-1 epochs')
     p.add_argument('--stage2_epochs', type=int, help='Stage-2 epochs')
+    p.add_argument('--seed', type=int, help='Random seed for reproducibility')
     p.add_argument('--resume',       type=str, default=None,
                    help='Checkpoint path to resume from')
     p.add_argument('--no_amp',       action='store_true',

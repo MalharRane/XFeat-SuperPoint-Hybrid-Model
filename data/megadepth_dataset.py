@@ -1046,6 +1046,7 @@ def build_dataloader(
     max_pairs_per_scene: int = 200,
     augment:           bool  = True,
     verify_pairs:      bool  = True,
+    timeout_s:         int   = 0,
 ) -> DataLoader:
     """
     Build a DataLoader for either synthetic or MegaDepth training.
@@ -1091,14 +1092,18 @@ def build_dataloader(
             f"mode must be 'synthetic', 'megadepth', or 'megadepth_raw', got '{mode}'"
         )
 
+    num_workers = max(0, int(num_workers))
+    timeout_s = max(0, int(timeout_s))
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=torch.cuda.is_available(),
         drop_last=True,
         collate_fn=_collate_fn,
+        timeout=(timeout_s if num_workers > 0 else 0),
+        persistent_workers=(num_workers > 0),
     )
 
 

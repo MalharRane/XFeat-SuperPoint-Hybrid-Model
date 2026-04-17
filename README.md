@@ -67,6 +67,11 @@ cd XFeat-SuperPoint-Hybrid-Model
 pip install -r requirements.txt
 ```
 
+For reproducible Colab runs, use the pinned lock file:
+```bash
+pip install -r requirements-colab.txt
+```
+
 ### 3. Link upstream models
 
 **XFeat** (required):

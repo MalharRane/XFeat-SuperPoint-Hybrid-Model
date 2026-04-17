@@ -65,7 +65,8 @@ balance_pos_neg:          true   # normalise positive/negative hinge terms separ
 # Optimisation
 # ---------------------------------------------------------------------------
 batch_size:       4          # Pairs per batch (reduce if OOM)
-num_workers:      4          # DataLoader workers (set 0 for debug)
+num_workers:      0          # Colab-safe default; optionally test 2/4 after stability checks
+dataloader_timeout_s: 0      # Only applies when num_workers > 0
 max_epochs:       80         # Longer schedule helps after late-stage LR drops on small MegaDepth splits
 lr:               1.0e-4     # Initial Adam learning rate
 weight_decay:     1.0e-4     # L2 regularisation
