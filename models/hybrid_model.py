@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import logging
 import inspect
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 
 from .sampler import DifferentiableDescriptorSampler
 
@@ -194,6 +194,200 @@ class HybridModel(nn.Module):
     @staticmethod
     def _normalize_for_superpoint(x: torch.Tensor) -> torch.Tensor:
         return x.clamp(0.0, 1.0)
+
+    # ------------------------------------------------------------------
+    # XFeat compatibility adapter
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_heatmap_from_keypoints(
+        keypoints: Any,
+        scores: Any,
+        batch_size: int,
+        image_hw: Tuple[int, int],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Best-effort conversion of keypoints/scores to a dense heatmap tensor."""
+        H, W = image_hw
+        heatmap = torch.zeros((batch_size, 1, H, W), device=device, dtype=dtype)
+
+        def _to_kp_list(value: Any, bsz: int) -> List[torch.Tensor]:
+            if isinstance(value, list):
+                return [v if isinstance(v, torch.Tensor) else torch.empty(0, 2, device=device, dtype=dtype) for v in value]
+            if isinstance(value, torch.Tensor):
+                if value.dim() == 3 and value.shape[0] == bsz:
+                    return [value[b] for b in range(bsz)]
+                if value.dim() == 2 and bsz == 1:
+                    return [value]
+            return [torch.empty(0, 2, device=device, dtype=dtype) for _ in range(bsz)]
+
+        def _to_score_list(value: Any, bsz: int) -> List[torch.Tensor]:
+            if value is None:
+                return [torch.ones(0, device=device, dtype=dtype) for _ in range(bsz)]
+            if isinstance(value, list):
+                out = []
+                for v in value:
+                    if isinstance(v, torch.Tensor):
+                        out.append(v)
+                    else:
+                        out.append(torch.ones(0, device=device, dtype=dtype))
+                return out
+            if isinstance(value, torch.Tensor):
+                if value.dim() == 2 and value.shape[0] == bsz:
+                    return [value[b] for b in range(bsz)]
+                if value.dim() == 1 and bsz == 1:
+                    return [value]
+            return [torch.ones(0, device=device, dtype=dtype) for _ in range(bsz)]
+
+        kp_list = _to_kp_list(keypoints, batch_size)
+        sc_list = _to_score_list(scores, batch_size)
+
+        for b in range(batch_size):
+            kp = kp_list[b]
+            if not isinstance(kp, torch.Tensor) or kp.numel() == 0:
+                continue
+            kp = kp.to(device=device, dtype=torch.float32)
+            if kp.dim() != 2 or kp.shape[1] < 2:
+                continue
+            sc = sc_list[b]
+            if not isinstance(sc, torch.Tensor) or sc.numel() != kp.shape[0]:
+                sc = torch.ones(kp.shape[0], device=device, dtype=dtype)
+            else:
+                sc = sc.to(device=device, dtype=dtype).view(-1)
+
+            x = kp[:, 0].round().long().clamp(0, W - 1)
+            y = kp[:, 1].round().long().clamp(0, H - 1)
+            heatmap[b, 0, y, x] = torch.maximum(heatmap[b, 0, y, x], sc)
+
+        return heatmap
+
+    def _normalize_xfeat_result_to_heatmap(
+        self,
+        result: Any,
+        xfeat_input: torch.Tensor,
+        image_hw: Tuple[int, int],
+    ) -> torch.Tensor:
+        """Normalize multiple XFeat API outputs to a dense heatmap tensor."""
+        B = xfeat_input.shape[0]
+        H, W = image_hw
+
+        def _as_heatmap_tensor(value: Any) -> Optional[torch.Tensor]:
+            if not isinstance(value, torch.Tensor):
+                return None
+            t = value
+            if t.dim() == 4:
+                if t.shape[0] != B:
+                    return None
+                return t
+            if t.dim() == 3:
+                if t.shape[-1] == 2:
+                    return None
+                if t.shape[0] == B:
+                    return t.unsqueeze(1)
+                if B == 1:
+                    return t.unsqueeze(0)
+            if t.dim() == 2 and B == 1:
+                if t.shape[-1] == 2:
+                    return None
+                return t.unsqueeze(0).unsqueeze(0)
+            return None
+
+        if isinstance(result, dict):
+            for key in ('heatmap', 'heatmaps', 'logits', 'score_map', 'scores', 'keypoints'):
+                t = _as_heatmap_tensor(result.get(key))
+                if t is not None:
+                    return t
+            if 'keypoints' in result:
+                return self._build_heatmap_from_keypoints(
+                    keypoints=result.get('keypoints'),
+                    scores=result.get('scores'),
+                    batch_size=B,
+                    image_hw=(H, W),
+                    device=xfeat_input.device,
+                    dtype=xfeat_input.dtype,
+                )
+
+        if isinstance(result, (tuple, list)):
+            for v in result:
+                t = _as_heatmap_tensor(v)
+                if t is not None:
+                    return t
+
+        t = _as_heatmap_tensor(result)
+        if t is not None:
+            return t
+
+        raise RuntimeError(
+            "XFeat adapter could not normalize model output to a heatmap tensor. "
+            f"output_type={type(result).__name__}"
+        )
+
+    def _call_xfeat_forward(self, xfeat_input: torch.Tensor) -> Tuple[torch.Tensor, str]:
+        """Call XFeat across forward and wrapper-style inference APIs."""
+        xfeat_cls = type(self.xfeat)
+        xfeat_info = f"{xfeat_cls.__module__}.{xfeat_cls.__name__}"
+        methods = (
+            ('forward', lambda: self.xfeat(xfeat_input)),
+            ('detectAndCompute', lambda: self._call_xfeat_detect_compute('detectAndCompute', xfeat_input)),
+            ('detect_and_compute', lambda: self._call_xfeat_detect_compute('detect_and_compute', xfeat_input)),
+            ('extract', lambda: self._call_xfeat_detect_compute('extract', xfeat_input)),
+            ('detect', lambda: self._call_xfeat_detect_compute('detect', xfeat_input)),
+        )
+
+        tried: List[str] = []
+        first_err: Optional[Exception] = None
+        H, W = int(xfeat_input.shape[2]), int(xfeat_input.shape[3])
+
+        for name, fn in methods:
+            if name != 'forward' and not hasattr(self.xfeat, name):
+                continue
+            try:
+                raw = fn()
+                heatmap = self._normalize_xfeat_result_to_heatmap(raw, xfeat_input, (H, W))
+                return heatmap, name
+            except Exception as exc:
+                tried.append(name)
+                if first_err is None:
+                    first_err = exc
+
+        supported = ', '.join(tried) if tried else '(none)'
+        raise RuntimeError(
+            "No supported XFeat invocation API found for HybridModel. "
+            f"Detected module={xfeat_info}. Tried APIs={supported}. "
+            "Expected one of: nn.Module.forward(tensor) returning tensor/dict/tuple; "
+            "or wrapper methods detectAndCompute/detect_and_compute/extract/detect "
+            "returning heatmap-like outputs or keypoints/scores."
+        ) from first_err
+
+    def _call_xfeat_detect_compute(self, method_name: str, xfeat_input: torch.Tensor) -> Any:
+        method = getattr(self.xfeat, method_name)
+        try:
+            return method(xfeat_input)
+        except Exception:
+            per_image_out = []
+            for b in range(xfeat_input.shape[0]):
+                xb = xfeat_input[b:b + 1]
+                try:
+                    out = method(xb)
+                except Exception:
+                    out = method(xb.squeeze(0))
+                per_image_out.append(out)
+            if len(per_image_out) == 1:
+                return per_image_out[0]
+            keypoints_list: List[Any] = []
+            scores_list: List[Any] = []
+            for o in per_image_out:
+                if isinstance(o, dict):
+                    keypoints_list.append(o.get('keypoints'))
+                    scores_list.append(o.get('scores'))
+                elif isinstance(o, (tuple, list)) and len(o) >= 1:
+                    keypoints_list.append(o[0])
+                    scores_list.append(o[1] if len(o) > 1 else None)
+                else:
+                    keypoints_list.append(o)
+                    scores_list.append(None)
+            return {'keypoints': keypoints_list, 'scores': scores_list}
 
     # ------------------------------------------------------------------
     # Heatmap decoding
@@ -421,22 +615,13 @@ class HybridModel(nn.Module):
         # Reset the hook capture before each forward so we always get the
         # output from *this* call (not a stale tensor from a previous step).
         self._xfeat_kp_output = None
-        raw_output = self.xfeat(xfeat_input)
+        adapter_heatmap, adapter_name = self._call_xfeat_forward(xfeat_input)
 
         # Prefer the hook-captured trainable head output when available.
-        # The hook is installed on the unfrozen kp head, so its output always
-        # has requires_grad=True.  raw_output['keypoints'] may point to a
-        # *different*, frozen head (e.g. heatmap_head), which would give a
-        # tensor with requires_grad=False — breaking the gradient path and
-        # causing RuntimeError in loss.backward().
         if self._xfeat_kp_output is not None:
             heatmap = self._xfeat_kp_output
-        elif isinstance(raw_output, dict):
-            heatmap = raw_output['keypoints']
-        elif isinstance(raw_output, (list, tuple)):
-            heatmap = raw_output[0]
         else:
-            heatmap = raw_output
+            heatmap = adapter_heatmap
 
         keypoints_px_list, scores_list = self._decode_xfeat_heatmap(heatmap, (H, W))
 
@@ -469,6 +654,7 @@ class HybridModel(nn.Module):
                 'keypoints_px': keypoints_px_list,
                 'scores': scores_list,
                 'heatmap': heatmap,
+                'xfeat_adapter_path': adapter_name,
             })
 
         return output

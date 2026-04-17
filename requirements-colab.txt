@@ -1,0 +1,14 @@
+# Pinned dependencies for reproducible Colab runs
+torch==2.3.1
+torchvision==0.18.1
+numpy==1.26.4
+scipy==1.13.1
+Pillow==10.3.0
+opencv-python-headless==4.10.0.84
+h5py==3.11.0
+tensorboard==2.16.2
+pyyaml==6.0.2
+tqdm==4.66.4
+kornia==0.7.4
+matplotlib==3.8.4
+lightning-utilities==0.11.7
