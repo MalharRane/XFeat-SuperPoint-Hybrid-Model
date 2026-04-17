@@ -4,7 +4,7 @@
 
 | Notebook date | Python | torch / torchvision | accelerated_features | SuperPoint | Hybrid repo |
 |---|---|---|---|---|---|
-| 2026-04-17 | 3.10.x (Colab) | 2.3.1 / 0.18.1 | `e92685f57f8318b18725c5c8c0bd28c7fe188d9a` | `1411bbd68c50163555d39c1b26e9e046ebd48f27` | pinned by `HYBRID_REPO_REF` (default: current clone) |
+| 2026-04-17 | 3.10.x (Colab) | 2.6.0 / 0.21.0 | `e92685f57f8318b18725c5c8c0bd28c7fe188d9a` | `1411bbd68c50163555d39c1b26e9e046ebd48f27` | pinned by `HYBRID_REPO_REF` (default: current clone) |
 
 ## Known bad combinations
 
