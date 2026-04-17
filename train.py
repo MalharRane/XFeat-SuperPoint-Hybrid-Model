@@ -25,7 +25,6 @@ See config.yaml for all available hyperparameters.
 """
 
 import os
-os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
 import sys
 import time
 import argparse
@@ -251,7 +250,12 @@ def _runtime_error_with_stage(stage: str, exc: Exception) -> RuntimeError:
 
 def _is_amp_runtime_error(exc: RuntimeError) -> bool:
     msg = str(exc).lower()
-    return any(s in msg for s in ('amp', 'autocast', 'float16', 'bfloat16', 'half', 'dtype', 'cuda'))
+    has_amp_context = any(s in msg for s in ('amp', 'autocast', 'gradscaler', 'fp16', 'bf16'))
+    has_dtype_context = any(s in msg for s in ('float16', 'bfloat16', 'half', 'dtype'))
+    has_cuda_context = 'cuda' in msg
+    return (has_amp_context and (has_dtype_context or has_cuda_context)) or (
+        has_dtype_context and 'autocast' in msg
+    )
 
 
 def _validate_image_size(cfg: Dict) -> None:
@@ -295,6 +299,18 @@ def _load_checkpoint_payload(path: Path) -> Dict[str, Any]:
             f"Invalid checkpoint format for {path}: expected dict payload, got {type(payload).__name__}."
         )
     return payload
+
+
+def _atomic_torch_save(state: Dict[str, Any], output_path: Path, prefix: str) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(prefix=prefix, suffix='.pth', dir=str(output_path.parent), delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        torch.save(state, str(tmp_path))
+        os.replace(tmp_path, output_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
 
 
 def _validate_and_load_pretrained_weights(
@@ -673,7 +689,7 @@ def validate(
 def save_checkpoint(
     model:     HybridModel,
     optimizer: optim.Optimizer,
-    scheduler: optim.lr_scheduler.ReduceLROnPlateau,
+    scheduler: Optional[optim.lr_scheduler.ReduceLROnPlateau],
     scaler:    GradScaler,
     epoch:     int,
     loss:      float,
@@ -689,31 +705,18 @@ def save_checkpoint(
         'config':      cfg,
         'model':       model.state_dict(),
         'optimizer':   optimizer.state_dict(),
-        'scheduler':   scheduler.state_dict(),
         'scaler':      scaler.state_dict(),
     }
+    if scheduler is not None:
+        state['scheduler'] = scheduler.state_dict()
 
     path = ckpt_dir / f'epoch_{epoch:04d}.pth'
-    with tempfile.NamedTemporaryFile(prefix='ckpt_', suffix='.pth', dir=str(ckpt_dir), delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-    try:
-        torch.save(state, str(tmp_path))
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+    _atomic_torch_save(state, path, prefix='ckpt_')
     log.info(f"  Saved checkpoint → {path}")
 
     if is_best:
         best_path = ckpt_dir / 'best.pth'
-        with tempfile.NamedTemporaryFile(prefix='ckpt_best_', suffix='.pth', dir=str(ckpt_dir), delete=False) as tmp:
-            tmp_best_path = Path(tmp.name)
-        try:
-            torch.save(state, str(tmp_best_path))
-            os.replace(tmp_best_path, best_path)
-        finally:
-            if tmp_best_path.exists():
-                tmp_best_path.unlink(missing_ok=True)
+        _atomic_torch_save(state, best_path, prefix='ckpt_best_')
         log.info(f"  ★ New best → {best_path}")
 
 
@@ -724,6 +727,7 @@ def load_checkpoint(
     scheduler: optim.lr_scheduler.ReduceLROnPlateau,
     scaler:    GradScaler,
     device:    torch.device,
+    require_scheduler_state: bool = True,
 ) -> int:
     """Load checkpoint, return start epoch."""
     state = torch.load(path, map_location=device)
@@ -732,11 +736,13 @@ def load_checkpoint(
     optimizer.load_state_dict(state['optimizer'])
     if 'scheduler' in state and isinstance(state['scheduler'], dict):
         scheduler.load_state_dict(state['scheduler'])
-    else:
+    elif require_scheduler_state:
         raise RuntimeError(
             f"Invalid resume checkpoint {path}: missing 'scheduler' state. "
             "Suggested recovery: start fresh or resume from a full training checkpoint."
         )
+    else:
+        log.warning("Resume checkpoint has no scheduler state; continuing with fresh scheduler state.")
     if 'scaler' in state and isinstance(state['scaler'], dict):
         scaler.load_state_dict(state['scaler'])
     epoch = state['epoch'] + 1
@@ -749,6 +755,8 @@ def load_checkpoint(
 # ---------------------------------------------------------------------------
 
 def train(cfg: Dict, resume: Optional[str] = None) -> None:
+    # TensorBoard's transitive deps can trigger TensorFlow plugin logs in some runtimes.
+    os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
     if cfg.get('mode') in {'megadepth', 'megadepth_raw'}:
         train_split = str(cfg.get('train_split', 'train')).lower()
         val_split = str(cfg.get('val_split', 'val')).lower()
@@ -764,7 +772,8 @@ def train(cfg: Dict, resume: Optional[str] = None) -> None:
             )
     _validate_image_size(cfg)
     _set_reproducible_seed(int(cfg.get('seed', 42)))
-    if os.environ.get('COLAB_GPU') and int(cfg.get('num_workers', 0)) > 0:
+    is_colab = bool(os.environ.get('COLAB_GPU')) or ('google.colab' in sys.modules)
+    if is_colab and int(cfg.get('num_workers', 0)) > 0:
         log.warning(
             "Colab runtime detected: using num_workers=0 safe default. "
             "You can test 2/4 workers after confirming stability."

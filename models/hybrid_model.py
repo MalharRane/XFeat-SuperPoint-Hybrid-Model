@@ -256,6 +256,8 @@ class HybridModel(nn.Module):
             else:
                 sc = sc.to(device=device, dtype=dtype).view(-1)
 
+            # Adapter expects keypoints in [x, y] pixel convention (used by
+            # XFeat and detectAndCompute-style wrappers handled here).
             x = kp[:, 0].round().long().clamp(0, W - 1)
             y = kp[:, 1].round().long().clamp(0, H - 1)
             heatmap[b, 0, y, x] = torch.maximum(heatmap[b, 0, y, x], sc)
@@ -364,13 +366,17 @@ class HybridModel(nn.Module):
         method = getattr(self.xfeat, method_name)
         try:
             return method(xfeat_input)
-        except Exception:
+        except (TypeError, ValueError, RuntimeError, NotImplementedError, AttributeError) as batch_err:
+            log.warning(
+                f"[HybridModel] XFeat method '{method_name}' failed on batched input; "
+                f"falling back to per-image mode. reason={type(batch_err).__name__}: {batch_err}"
+            )
             per_image_out = []
             for b in range(xfeat_input.shape[0]):
                 xb = xfeat_input[b:b + 1]
                 try:
                     out = method(xb)
-                except Exception:
+                except (TypeError, ValueError, RuntimeError, NotImplementedError, AttributeError):
                     out = method(xb.squeeze(0))
                 per_image_out.append(out)
             if len(per_image_out) == 1:
