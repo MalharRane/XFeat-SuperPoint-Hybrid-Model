@@ -143,7 +143,7 @@ def run_preflight(
             out2 = model.forward_train(image2)
             validate_lightglue_contract(out1, descriptor_dim=int(cfg["descriptor_dim"]))
             validate_lightglue_contract(out2, descriptor_dim=int(cfg["descriptor_dim"]))
-            loss, stats = loss_fn.forward_batch(
+            loss, loss_stats = loss_fn.forward_batch(
                 out1,
                 out2,
                 homographies=homography,
@@ -164,7 +164,7 @@ def run_preflight(
             optimizer.zero_grad(set_to_none=True)
             out1 = model.forward_train(image1)
             out2 = model.forward_train(image2)
-            loss, stats = loss_fn.forward_batch(
+            loss, loss_stats = loss_fn.forward_batch(
                 out1,
                 out2,
                 homographies=homography,
@@ -180,7 +180,11 @@ def run_preflight(
     if not tensor_is_finite(loss) or not grads_are_finite(model.parameters()):
         raise RuntimeError("Preflight failed: found NaN/Inf in loss or gradients")
 
-    log.info("Preflight forward/backward success | loss=%.4f sim_gap=%.4f", float(stats.get("loss", 0.0)), float(stats.get("sim_gap", 0.0)))
+    log.info(
+        "Preflight forward/backward success | loss=%.4f sim_gap=%.4f",
+        float(loss_stats.get("loss", 0.0)),
+        float(loss_stats.get("sim_gap", 0.0)),
+    )
 
 
 def train_step(

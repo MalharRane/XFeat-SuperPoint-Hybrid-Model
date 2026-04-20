@@ -177,6 +177,7 @@ class HybridModelV2(nn.Module):
     @staticmethod
     def _sparse_to_dense_heatmap(data: Dict[str, Any], b: int, image_hw: Tuple[int, int]) -> torch.Tensor:
         h, w = image_hw
+        feature_stride = 8
         heat = torch.zeros((b, 1, h, w), dtype=torch.float32)
         kps = data.get("keypoints", [torch.empty(0, 2)] * b)
         scores = data.get("scores", [torch.empty(0)] * b)
@@ -192,7 +193,7 @@ class HybridModelV2(nn.Module):
                 heat[i, 0, xy[:, 1], xy[:, 0]] = sc.float().clamp(0, 1)
             else:
                 heat[i, 0, xy[:, 1], xy[:, 0]] = 1.0
-            return F.avg_pool2d(heat, kernel_size=self._FEATURE_STRIDE, stride=self._FEATURE_STRIDE)
+        return F.avg_pool2d(heat, kernel_size=feature_stride, stride=feature_stride)
 
     def forward_train(self, image: torch.Tensor) -> Dict[str, List[torch.Tensor]]:
         b, c, h, w = image.shape

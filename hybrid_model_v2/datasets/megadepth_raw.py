@@ -176,9 +176,9 @@ class MegaDepthRawDatasetV2(Dataset):
             factor = random.uniform(0.7, 1.3)
             pil = ImageEnhance.Brightness(pil).enhance(factor)
         if random.random() < 0.35:
-            pil = pil.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.2, 1.5)))
+            pil = pil.filter(ImageFilter.GaussianBlur(radius=float(random.randint(0, 2))))
         if random.random() < 0.25:
-            pil = pil.filter(ImageFilter.BoxBlur(radius=random.uniform(0.5, 1.2)))
+            pil = pil.filter(ImageFilter.BoxBlur(radius=int(random.randint(1, 2))))
         out = TF.to_tensor(pil).float()
         if random.random() < 0.5:
             noise = torch.randn_like(out) * random.uniform(0.005, 0.03)
