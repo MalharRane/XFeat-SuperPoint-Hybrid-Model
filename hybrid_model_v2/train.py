@@ -74,8 +74,12 @@ def build_model_v2(cfg: Dict[str, Any], device: torch.device) -> HybridModelV2:
     if not xf_path.exists():
         raise FileNotFoundError(f"XFeat weights not found: {xf_path}")
 
+    # xfeat.pt was saved from XFeatModel directly (bare keys like "block1.*.weight"),
+    # but the XFeat wrapper stores it as self.net, so its state_dict() has "net.*"
+    # keys.  Loading into xfeat.net gives the correct key alignment.
+    xfeat_target = xfeat.net if hasattr(xfeat, "net") else xfeat
     xf_overlap, xf_total, xf_miss, xf_unexp = load_weights_strictish(
-        xfeat,
+        xfeat_target,
         xf_path,
         module_name="XFeat",
         strict=False,
