@@ -21,7 +21,10 @@ def build_xfeat() -> nn.Module:
         raise ModelImportError(
             "Could not import XFeat from modules.xfeat. Clone accelerated_features and set PYTHONPATH."
         ) from e
-    return XFeat()
+    # Pass weights=None to skip the constructor's built-in auto-loading, which
+    # uses a default path that does not exist after a plain `git clone`.
+    # Weights are loaded separately by load_weights_strictish in build_model_v2.
+    return XFeat(weights=None)
 
 
 def _instantiate_sp(cls: Any) -> nn.Module:
