@@ -195,6 +195,8 @@ python train.py \
 ### Google Colab
 Open **`XFeat_SuperPoint_Fixed_Training.ipynb`** — it handles all setup, data download, and training automatically on MegaDepth-1500.
 
+For `hybrid_model_v2`, use **`Hybrid_Model_V2_Training_Colab.ipynb`** (pinned Colab-compatible refs + `hybrid_model_v2/train.py` runbook).
+
 ### Fixed A/B benchmark + LightGlue match inspection
 
 Use the same held-out pairs to compare two checkpoints and inspect matching quality:
