@@ -15,6 +15,7 @@ class HybridModelV2(nn.Module):
     # These are the single-channel equivalents expected by the upstream model.
     _XFEAT_MEAN = 0.485
     _XFEAT_STD = 0.229
+    _FEATURE_STRIDE = 8
 
     def __init__(
         self,
@@ -114,6 +115,7 @@ class HybridModelV2(nn.Module):
         h, w = image_hw
 
         if c == 65:
+            # Channel 65 is the dustbin (no-keypoint) class; exclude it.
             prob = F.softmax(logits, dim=1)[:, :-1]
         elif c == 64:
             prob = torch.sigmoid(logits)
@@ -122,7 +124,7 @@ class HybridModelV2(nn.Module):
         else:
             raise RuntimeError(f"Unsupported XFeat keypoint channels: {c}")
 
-        heat = F.pixel_shuffle(prob, upscale_factor=8)
+        heat = F.pixel_shuffle(prob, upscale_factor=self._FEATURE_STRIDE)
         if heat.shape[-2:] != (h, w):
             heat = F.interpolate(heat, size=(h, w), mode="bilinear", align_corners=False)
 
@@ -190,14 +192,14 @@ class HybridModelV2(nn.Module):
                 heat[i, 0, xy[:, 1], xy[:, 0]] = sc.float().clamp(0, 1)
             else:
                 heat[i, 0, xy[:, 1], xy[:, 0]] = 1.0
-        return F.avg_pool2d(heat, kernel_size=8, stride=8)
+            return F.avg_pool2d(heat, kernel_size=self._FEATURE_STRIDE, stride=self._FEATURE_STRIDE)
 
     def forward_train(self, image: torch.Tensor) -> Dict[str, List[torch.Tensor]]:
         b, c, h, w = image.shape
         if c != 1:
             raise RuntimeError(f"Input must be grayscale (B,1,H,W), got shape {tuple(image.shape)}")
-        if h % 8 != 0 or w % 8 != 0:
-            raise RuntimeError("Input H and W must be divisible by 8")
+        if h % self._FEATURE_STRIDE != 0 or w % self._FEATURE_STRIDE != 0:
+            raise RuntimeError(f"Input H and W must be divisible by {self._FEATURE_STRIDE}")
 
         self.superpoint.eval()
         xfeat_logits = self._call_xfeat_forward(self._normalize_for_xfeat(image))

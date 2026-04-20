@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+_FEATURE_STRIDE = 8
+
 
 class DifferentiableDescriptorSampler(nn.Module):
     def __init__(self, mode: str = "bicubic", padding_mode: str = "border"):
@@ -16,9 +18,9 @@ class DifferentiableDescriptorSampler(nn.Module):
     @staticmethod
     def _pixels_to_grid(keypoints_px: torch.Tensor, image_hw: Tuple[int, int]) -> torch.Tensor:
         h, w = image_hw
-        hc, wc = h // 8, w // 8
-        x = keypoints_px[:, 0] / 8.0
-        y = keypoints_px[:, 1] / 8.0
+        hc, wc = h // _FEATURE_STRIDE, w // _FEATURE_STRIDE
+        x = keypoints_px[:, 0] / float(_FEATURE_STRIDE)
+        y = keypoints_px[:, 1] / float(_FEATURE_STRIDE)
         x = 2.0 * x / max(wc - 1, 1) - 1.0
         y = 2.0 * y / max(hc - 1, 1) - 1.0
         return torch.stack([x, y], dim=-1).unsqueeze(0).unsqueeze(0)

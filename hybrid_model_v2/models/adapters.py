@@ -28,6 +28,7 @@ def _instantiate_sp(cls: Any) -> nn.Module:
     try:
         return cls()
     except TypeError:
+        # Some SuperPoint forks expect a config-dict constructor signature.
         return cls({})
 
 

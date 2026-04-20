@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler, autocast
 
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -138,7 +138,7 @@ def run_preflight(
     optimizer.zero_grad(set_to_none=True)
 
     try:
-        with autocast("cuda", enabled=amp_enabled):
+        with autocast(enabled=amp_enabled):
             out1 = model.forward_train(image1)
             out2 = model.forward_train(image2)
             validate_lightglue_contract(out1, descriptor_dim=int(cfg["descriptor_dim"]))
@@ -210,7 +210,7 @@ def train_step(
     amp_enabled = bool(cfg.get("mixed_precision", True) and device.type == "cuda")
 
     def _forward(use_amp: bool):
-        with autocast("cuda", enabled=use_amp):
+        with autocast(enabled=use_amp):
             out1 = model.forward_train(image1)
             out2 = model.forward_train(image2)
             validate_lightglue_contract(out1, descriptor_dim=int(cfg["descriptor_dim"]))
@@ -340,7 +340,7 @@ def main() -> None:
         patience=int(cfg.get("lr_patience", 3)),
         min_lr=float(cfg.get("min_lr", 1e-6)),
     )
-    scaler = GradScaler("cuda", enabled=bool(cfg.get("mixed_precision", True) and device.type == "cuda"))
+    scaler = GradScaler(enabled=bool(cfg.get("mixed_precision", True) and device.type == "cuda"))
 
     tb_writer, wandb_run = setup_tracking(cfg)
 
@@ -361,10 +361,10 @@ def main() -> None:
         assert_superpoint_frozen(model)
 
         if cfg.get("unfreeze_at_epoch") is not None and epoch >= int(cfg["unfreeze_at_epoch"]):
-            newly = model.unfreeze_xfeat_modules(cfg.get("unfreeze_keywords", []))
+            newly_unfrozen_params = model.unfreeze_xfeat_modules(cfg.get("unfreeze_keywords", []))
             added = _add_new_trainable_params(model, optimizer, float(cfg.get("lr", 1e-4)), float(cfg.get("weight_decay", 1e-4)))
-            if newly > 0:
-                log.info("Staged unfreeze at epoch %d: newly_unfrozen=%d optimizer_added=%d", epoch, newly, added)
+            if newly_unfrozen_params > 0:
+                log.info("Staged unfreeze at epoch %d: newly_unfrozen=%d optimizer_added=%d", epoch, newly_unfrozen_params, added)
                 cfg["unfreeze_at_epoch"] = None
 
         train_stats_list: List[Dict[str, float]] = []

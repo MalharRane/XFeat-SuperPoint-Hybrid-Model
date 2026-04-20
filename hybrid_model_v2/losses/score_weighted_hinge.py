@@ -118,7 +118,7 @@ class ScoreWeightedHingeRepeatabilityLoss(nn.Module):
 
         sim = d1 @ d2.T
         w = scores1.float().unsqueeze(1) * scores2.float().unsqueeze(0)
-        w = w / w.mean().clamp(min=max(_EPS, 1e-6))
+        w = w / w.mean().clamp(min=1e-6)
 
         pos = self.lambda_d * S * w * F.relu(self.mp - sim)
         neg = (1.0 - S) * w * F.relu(sim - self.mn)

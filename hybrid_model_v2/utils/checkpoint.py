@@ -12,7 +12,7 @@ def save_checkpoint(
     epoch: int,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,
+    scaler: torch.cuda.amp.GradScaler,
     scheduler: Optional[torch.optim.lr_scheduler.ReduceLROnPlateau],
     cfg: Dict[str, Any],
     val_loss: float,
@@ -44,7 +44,7 @@ def load_checkpoint(
     path: str,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,
+    scaler: torch.cuda.amp.GradScaler,
     scheduler: Optional[torch.optim.lr_scheduler.ReduceLROnPlateau],
     device: torch.device,
 ) -> int:
