@@ -11,6 +11,8 @@ from .sampler import DifferentiableDescriptorSampler
 
 
 class HybridModelV2(nn.Module):
+    # Grayscale normalization constants used by the XFeat preprocessing path.
+    # These are the single-channel equivalents expected by the upstream model.
     _XFEAT_MEAN = 0.485
     _XFEAT_STD = 0.229
 
@@ -193,7 +195,7 @@ class HybridModelV2(nn.Module):
     def forward_train(self, image: torch.Tensor) -> Dict[str, List[torch.Tensor]]:
         b, c, h, w = image.shape
         if c != 1:
-            raise RuntimeError("Input must be grayscale (B,1,H,W)")
+            raise RuntimeError(f"Input must be grayscale (B,1,H,W), got shape {tuple(image.shape)}")
         if h % 8 != 0 or w % 8 != 0:
             raise RuntimeError("Input H and W must be divisible by 8")
 

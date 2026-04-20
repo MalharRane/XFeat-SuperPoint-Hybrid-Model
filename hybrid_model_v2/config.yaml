@@ -40,6 +40,7 @@ early_stop_patience: 12
 lr_patience: 3
 lr_factor: 0.5
 min_lr: 1.0e-6
+val_max_batches: 20
 
 superpoint_weights_path: weights/superpoint_v1.pth
 superpoint_weights_url: https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/superpoint_v1.pth

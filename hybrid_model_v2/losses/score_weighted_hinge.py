@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+_EPS = 1e-8
+
 
 class ScoreWeightedHingeRepeatabilityLoss(nn.Module):
     def __init__(
@@ -33,7 +35,7 @@ class ScoreWeightedHingeRepeatabilityLoss(nn.Module):
         ones = torch.ones((n, 1), device=kp.device, dtype=kp.dtype)
         p = torch.cat([kp, ones], dim=1)
         wh = (H.to(kp.dtype) @ p.T)
-        return (wh[:2] / wh[2:].clamp(min=1e-8)).T
+        return (wh[:2] / wh[2:].clamp(min=_EPS)).T
 
     def _build_correspondence_from_homography(
         self, kp1: torch.Tensor, kp2: torch.Tensor, H: torch.Tensor, image2_hw: Tuple[int, int], depth_valid_1: Optional[torch.Tensor]
@@ -116,7 +118,7 @@ class ScoreWeightedHingeRepeatabilityLoss(nn.Module):
 
         sim = d1 @ d2.T
         w = scores1.float().unsqueeze(1) * scores2.float().unsqueeze(0)
-        w = w / w.mean().clamp(min=1e-6)
+        w = w / w.mean().clamp(min=max(_EPS, 1e-6))
 
         pos = self.lambda_d * S * w * F.relu(self.mp - sim)
         neg = (1.0 - S) * w * F.relu(sim - self.mn)

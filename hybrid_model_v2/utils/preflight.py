@@ -4,6 +4,8 @@ from typing import Any, Dict
 
 import torch
 
+_DESC_NORM_ATOL = 5e-2
+
 
 def validate_lightglue_contract(out: Dict[str, Any], descriptor_dim: int = 256) -> None:
     keys = ("keypoints", "keypoints_px", "descriptors", "scores")
@@ -32,7 +34,7 @@ def validate_lightglue_contract(out: Dict[str, Any], descriptor_dim: int = 256) 
         if not (kp.shape[0] == kp_px.shape[0] == d.shape[0] == s.shape[0]):
             raise RuntimeError(f"sample {i}: inconsistent N across outputs")
         norms = torch.linalg.norm(d, dim=1)
-        if norms.numel() > 0 and not torch.allclose(norms.mean(), torch.tensor(1.0, device=norms.device), atol=5e-2):
+        if norms.numel() > 0 and abs(float(norms.mean().item()) - 1.0) > _DESC_NORM_ATOL:
             raise RuntimeError(f"sample {i}: descriptor norms drift from 1")
 
 

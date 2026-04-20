@@ -13,6 +13,11 @@ from PIL import Image, ImageEnhance, ImageFilter
 from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms.functional as TF
 
+_ORB_MAX_MATCHES = 500  # cap candidate matches for stable/faster homography fit
+_PAIR_MAX_DELTA = 20
+_MIN_MATCHES_FOR_H = 30
+_MIN_INLIERS_FOR_H = 15
+
 
 def _list_images(img_dir: Path) -> List[Path]:
     exts = {".jpg", ".jpeg", ".png", ".webp"}
@@ -54,14 +59,14 @@ def _estimate_homography(img1: torch.Tensor, img2: torch.Tensor) -> Optional[tor
         return None
     bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
     m = sorted(bf.match(d1, d2), key=lambda x: x.distance)
-    if len(m) < 30:
+    if len(m) < _MIN_MATCHES_FOR_H:
         return None
-    pts1 = np.float32([k1[x.queryIdx].pt for x in m[:500]]).reshape(-1, 1, 2)
-    pts2 = np.float32([k2[x.trainIdx].pt for x in m[:500]]).reshape(-1, 1, 2)
+    pts1 = np.float32([k1[x.queryIdx].pt for x in m[:_ORB_MAX_MATCHES]]).reshape(-1, 1, 2)
+    pts2 = np.float32([k2[x.trainIdx].pt for x in m[:_ORB_MAX_MATCHES]]).reshape(-1, 1, 2)
     H, mask = cv2.findHomography(pts1, pts2, cv2.RANSAC, 3.0)
     if H is None or mask is None:
         return None
-    if int(mask.sum()) < 15:
+    if int(mask.sum()) < _MIN_INLIERS_FOR_H:
         return None
     if not np.isfinite(H).all():
         return None
@@ -132,7 +137,7 @@ class MegaDepthRawDatasetV2(Dataset):
         for scene, items in self.items_by_scene.items():
             n = len(items)
             local = []
-            max_delta = min(20, n - 1)
+            max_delta = min(_PAIR_MAX_DELTA, n - 1)
             for i in range(n):
                 for d in range(1, max_delta + 1):
                     j = i + d

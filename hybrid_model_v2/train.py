@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import sys
 from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
+
+if __package__ is None or __package__ == "":
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from hybrid_model_v2.datasets import build_dataloaders_v2
 from hybrid_model_v2.losses import ScoreWeightedHingeRepeatabilityLoss
@@ -27,6 +31,7 @@ from hybrid_model_v2.utils.preflight import assert_superpoint_frozen, check_plat
 
 
 log = setup_logging()
+_GRID_DIVISIBILITY = 8
 
 
 def _add_new_trainable_params(model: nn.Module, optimizer: optim.Optimizer, lr: float, weight_decay: float) -> int:
@@ -106,8 +111,8 @@ def run_preflight(
     scaler: GradScaler,
     device: torch.device,
 ) -> None:
-    if int(cfg["image_height"]) % 8 != 0 or int(cfg["image_width"]) % 8 != 0:
-        raise RuntimeError("image_height/image_width must be divisible by 8")
+    if int(cfg["image_height"]) % _GRID_DIVISIBILITY != 0 or int(cfg["image_width"]) % _GRID_DIVISIBILITY != 0:
+        raise RuntimeError(f"image_height/image_width must be divisible by {_GRID_DIVISIBILITY}")
 
     ds = train_loader.dataset
     if hasattr(ds, "items_by_scene"):
@@ -369,7 +374,7 @@ def main() -> None:
             global_step += 1
 
         train_stats = mean_stats(train_stats_list)
-        val_stats = validate(cfg, model, loss_fn, val_loader, device)
+        val_stats = validate(cfg, model, loss_fn, val_loader, device, max_batches=int(cfg.get("val_max_batches", 20)))
         val_loss = float(val_stats.get("loss", float("inf")))
         scheduler.step(val_loss)
 

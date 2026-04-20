@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -11,7 +12,10 @@ def ensure_file(path: Path, url: str) -> Path:
     if path.exists() and path.stat().st_size > 0:
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
-    urllib.request.urlretrieve(url, str(path))
+    try:
+        urllib.request.urlretrieve(url, str(path))
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+        raise RuntimeError(f"Failed to download weights from {url}: {e}") from e
     if not path.exists() or path.stat().st_size <= 0:
         raise RuntimeError(f"Failed to download weights from {url}")
     return path

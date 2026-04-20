@@ -6,8 +6,11 @@ from typing import Any, Dict, Tuple
 import torch
 import torch.nn as nn
 
+_SP_DESC_DIM = 256
+
 
 class ModelImportError(RuntimeError):
+    """Raised when a required upstream XFeat/SuperPoint dependency cannot be imported."""
     pass
 
 
@@ -81,10 +84,10 @@ def extract_superpoint_desc_map(sp: nn.Module, x: torch.Tensor) -> torch.Tensor:
             handle = None
             target = None
             for _, m in sp.named_modules():
-                if isinstance(m, nn.Conv2d) and m.out_channels == 256:
+                if isinstance(m, nn.Conv2d) and m.out_channels == _SP_DESC_DIM:
                     target = m
             if target is None:
-                raise RuntimeError("Could not locate 256-channel descriptor head in SuperPoint")
+                raise RuntimeError(f"Could not locate {_SP_DESC_DIM}-channel descriptor head in SuperPoint")
 
             def _hook(_m, _i, out):
                 if isinstance(out, torch.Tensor):
