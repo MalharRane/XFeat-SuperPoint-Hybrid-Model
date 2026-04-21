@@ -5,6 +5,7 @@ from typing import Any, Dict, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 _SP_DESC_DIM = 256
 
@@ -14,6 +15,80 @@ class ModelImportError(RuntimeError):
     pass
 
 
+class _SuperPointLegacy(nn.Module):
+    """Minimal SuperPoint re-implementation whose state-dict keys exactly match
+    the official ``superpoint_v1.pth`` checkpoint distributed by LightGlue::
+
+        conv1a.weight  conv1a.bias  …  convDb.weight  convDb.bias  (24 tensors)
+
+    The post-2023 rpautrat/SuperPoint uses VGGBlock + BatchNorm with nested keys
+    (``backbone.0.0.conv.weight``) that are completely incompatible with that
+    checkpoint.  This flat-key implementation avoids the dependency on any
+    external clone and guarantees weight loading succeeds without remapping.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.relu = nn.ReLU(inplace=True)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        c1, c2, c3, c4, c5 = 64, 64, 128, 128, 256
+
+        self.conv1a = nn.Conv2d(1, c1, 3, 1, 1)
+        self.conv1b = nn.Conv2d(c1, c1, 3, 1, 1)
+        self.conv2a = nn.Conv2d(c1, c2, 3, 1, 1)
+        self.conv2b = nn.Conv2d(c2, c2, 3, 1, 1)
+        self.conv3a = nn.Conv2d(c2, c3, 3, 1, 1)
+        self.conv3b = nn.Conv2d(c3, c3, 3, 1, 1)
+        self.conv4a = nn.Conv2d(c3, c4, 3, 1, 1)
+        self.conv4b = nn.Conv2d(c4, c4, 3, 1, 1)
+
+        self.convPa = nn.Conv2d(c4, c5, 3, 1, 1)
+        self.convPb = nn.Conv2d(c5, 65, 1, 1, 0)
+
+        self.convDa = nn.Conv2d(c4, c5, 3, 1, 1)
+        self.convDb = nn.Conv2d(c5, 256, 1, 1, 0)
+
+    def _encode(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.relu(self.conv1a(x))
+        x = self.relu(self.conv1b(x))
+        x = self.pool(x)
+        x = self.relu(self.conv2a(x))
+        x = self.relu(self.conv2b(x))
+        x = self.pool(x)
+        x = self.relu(self.conv3a(x))
+        x = self.relu(self.conv3b(x))
+        x = self.pool(x)
+        x = self.relu(self.conv4a(x))
+        x = self.relu(self.conv4b(x))
+        return x
+
+    def get_descriptor_map(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the dense descriptor map ``(B, 256, H/8, W/8)``, unnormalized.
+        This is the direct output of ``convDb`` and is consumed by
+        ``extract_superpoint_desc_map`` without going through the hook path.
+        """
+        if isinstance(x, dict):
+            x = x["image"]
+        if x.shape[1] == 3:
+            scale = x.new_tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1)
+            x = (x * scale).sum(1, keepdim=True)
+        feat = self._encode(x)
+        return self.convDb(self.relu(self.convDa(feat)))
+
+    def forward(self, data: Any) -> Dict[str, torch.Tensor]:
+        if isinstance(data, dict):
+            x = data["image"]
+        else:
+            x = data
+        if x.shape[1] == 3:
+            scale = x.new_tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1)
+            x = (x * scale).sum(1, keepdim=True)
+        feat = self._encode(x)
+        desc_map = self.convDb(self.relu(self.convDa(feat)))
+        scores = self.convPb(self.relu(self.convPa(feat)))
+        return {"descriptors_dense": desc_map, "scores": scores}
+
+
 def build_xfeat() -> nn.Module:
     try:
         from modules.xfeat import XFeat
@@ -21,7 +96,10 @@ def build_xfeat() -> nn.Module:
         raise ModelImportError(
             "Could not import XFeat from modules.xfeat. Clone accelerated_features and set PYTHONPATH."
         ) from e
-    return XFeat()
+    # Pass weights=None to skip the constructor's built-in auto-loading, which
+    # uses a default path that does not exist after a plain `git clone`.
+    # Weights are loaded separately by load_weights_strictish in build_model_v2.
+    return XFeat(weights=None)
 
 
 def _instantiate_sp(cls: Any) -> nn.Module:
@@ -33,24 +111,16 @@ def _instantiate_sp(cls: Any) -> nn.Module:
 
 
 def build_superpoint() -> nn.Module:
-    tried = []
-    for path in (
-        "superpoint.superpoint:SuperPoint",
-        "superpoint_pytorch:SuperPoint",
-        "superpoint:SuperPoint",
-    ):
-        mod_name, cls_name = path.split(":")
-        tried.append(path)
-        try:
-            mod = __import__(mod_name, fromlist=[cls_name])
-            cls = getattr(mod, cls_name)
-            return _instantiate_sp(cls)
-        except Exception:
-            continue
-    raise ModelImportError(
-        f"Could not import SuperPoint from supported paths: {tried}. "
-        "Install/clone a compatible SuperPoint implementation."
-    )
+    # Use the built-in flat-key implementation that matches superpoint_v1.pth.
+    #
+    # The post-2023 rpautrat/SuperPoint (commit 1411bbd and later) switched to a
+    # VGGBlock + BatchNorm architecture whose state-dict keys look like
+    # ``backbone.0.0.conv.weight``.  The LightGlue-distributed superpoint_v1.pth
+    # uses the original flat keys (``conv1a.weight``, …).  Loading the new
+    # rpautrat architecture from that checkpoint yields 0 % key overlap and a
+    # RuntimeError.  _SuperPointLegacy replicates the original flat-key layout,
+    # making weight loading work without any key remapping or external dependency.
+    return _SuperPointLegacy()
 
 
 def call_superpoint_forward(sp: nn.Module, x: torch.Tensor) -> Any:

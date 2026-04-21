@@ -158,21 +158,43 @@ class HybridModelV2(nn.Module):
         return keypoints_px, scores
 
     def _call_xfeat_forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.xfeat(x)
-        if isinstance(out, dict):
-            for key in ("keypoints", "heatmap", "logits"):
-                if key in out and isinstance(out[key], torch.Tensor):
-                    return out[key]
-        if isinstance(out, torch.Tensor):
-            return out
+        # The XFeat *wrapper* (accelerated_features) does not define forward();
+        # call the underlying XFeatModel (self.xfeat.net) directly.
+        # XFeatModel.forward(x) returns (feats, keypoints, heatmap) where
+        # keypoints is (B, 65, H/8, W/8) — handled by _decode_xfeat_heatmap.
+        _net = getattr(self.xfeat, "net", self.xfeat)
 
-        # wrapper APIs -> convert sparse points to heatmap
+        out = None
+        first_err = None
+        for payload in (x, {"image": x}):
+            try:
+                out = _net(payload)
+                break
+            except Exception as e:
+                if first_err is None:
+                    first_err = e
+
+        if out is not None:
+            # XFeatModel returns (feats, keypoints, heatmap); index 1 is keypoints
+            if isinstance(out, (tuple, list)) and len(out) >= 2:
+                candidate = out[1]
+                if isinstance(candidate, torch.Tensor):
+                    return candidate
+            if isinstance(out, dict):
+                for key in ("keypoints", "heatmap", "logits"):
+                    if key in out and isinstance(out[key], torch.Tensor):
+                        return out[key]
+            if isinstance(out, torch.Tensor):
+                return out
+
+        # Fallback: wrapper-level sparse-detection APIs (decorated with
+        # @torch.inference_mode, so gradients do not flow — last resort only)
         for method in ("detectAndCompute", "detect_and_compute", "extract", "detect"):
             if hasattr(self.xfeat, method):
                 data = getattr(self.xfeat, method)(x)
                 if isinstance(data, dict) and "keypoints" in data:
                     return self._sparse_to_dense_heatmap(data, x.shape[0], x.shape[-2:])
-        raise RuntimeError("Unsupported XFeat API for V2")
+        raise RuntimeError("Unsupported XFeat API for V2") from first_err
 
     @staticmethod
     def _sparse_to_dense_heatmap(data: Dict[str, Any], b: int, image_hw: Tuple[int, int]) -> torch.Tensor:

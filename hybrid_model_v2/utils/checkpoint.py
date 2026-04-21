@@ -52,7 +52,7 @@ def load_checkpoint(
     if not p.exists():
         raise FileNotFoundError(f"Checkpoint not found: {p}")
 
-    state = torch.load(str(p), map_location=device)
+    state = torch.load(str(p), map_location=device, weights_only=False)
     for key in ("epoch", "model", "optimizer", "scaler"):
         if key not in state:
             raise RuntimeError(f"Invalid checkpoint: missing '{key}'")

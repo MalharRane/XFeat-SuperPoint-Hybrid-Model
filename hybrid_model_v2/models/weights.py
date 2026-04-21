@@ -42,7 +42,7 @@ def load_weights_strictish(
     strict: bool = False,
     min_overlap_ratio: float = 0.10,
 ) -> Tuple[int, int, int, int]:
-    payload = torch.load(str(weight_path), map_location="cpu")
+    payload = torch.load(str(weight_path), map_location="cpu", weights_only=False)
     state = payload.get("model", payload)
     if not isinstance(state, dict):
         raise RuntimeError(f"{module_name} checkpoint payload invalid")
