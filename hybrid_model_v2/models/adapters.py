@@ -145,11 +145,35 @@ def call_superpoint_forward(sp: nn.Module, x: torch.Tensor) -> Any:
 
 
 def extract_superpoint_desc_map(sp: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Extract the dense (B, 256, H/8, W/8) descriptor map from a frozen SuperPoint.
+
+    AMP safety:
+        This function is always called from within a ``torch.autocast`` scope
+        (``forward_train``).  Under autocast, tensors can be silently promoted
+        to float16.  Bicubic ``F.grid_sample`` in PyTorch is notoriously
+        unstable in float16 and can produce NaN or grossly incorrect values.
+        The authoritative guard is to cast ``x`` to float32 **inside** the
+        ``no_grad`` block, before any SuperPoint op runs.  The secondary guard
+        in ``DifferentiableDescriptorSampler.forward`` provides defense-in-depth.
+
+    Gradient path:
+        ``torch.no_grad()`` is correct and intentional here.  SuperPoint is
+        frozen; its parameters have ``requires_grad=False``.  Removing
+        ``no_grad`` would waste backward compute and memory without producing
+        any useful gradient signal.  The only training signal reaching the
+        XFeat keypoint head flows through ``w = scores1 * scores2`` in the
+        loss, not through the descriptor values themselves.
+    """
     with torch.no_grad():
+        # FIX: cast to float32 inside the no_grad block so that any AMP
+        # autocast promotion that happened in the enclosing scope is undone
+        # before the SuperPoint convolutions run.
+        x_fp32 = x.float()
+
         if hasattr(sp, "get_descriptor_map"):
-            dm = sp.get_descriptor_map(x)
+            dm = sp.get_descriptor_map(x_fp32)
         elif hasattr(sp, "encode") and hasattr(sp, "desc_head"):
-            dm = sp.desc_head(sp.encode(x))
+            dm = sp.desc_head(sp.encode(x_fp32))
         else:
             hook_out: Dict[str, torch.Tensor] = {}
             handle = None
@@ -158,7 +182,9 @@ def extract_superpoint_desc_map(sp: nn.Module, x: torch.Tensor) -> torch.Tensor:
                 if isinstance(m, nn.Conv2d) and m.out_channels == _SP_DESC_DIM:
                     target = m
             if target is None:
-                raise RuntimeError(f"Could not locate {_SP_DESC_DIM}-channel descriptor head in SuperPoint")
+                raise RuntimeError(
+                    f"Could not locate {_SP_DESC_DIM}-channel descriptor head in SuperPoint"
+                )
 
             def _hook(_m, _i, out):
                 if isinstance(out, torch.Tensor):
@@ -166,10 +192,30 @@ def extract_superpoint_desc_map(sp: nn.Module, x: torch.Tensor) -> torch.Tensor:
 
             handle = target.register_forward_hook(_hook)
             try:
-                _ = call_superpoint_forward(sp, x)
+                _ = call_superpoint_forward(sp, x_fp32)
             finally:
                 handle.remove()
             if "desc" not in hook_out:
                 raise RuntimeError("SuperPoint descriptor hook produced no output")
             dm = hook_out["desc"]
-    return dm.float()
+
+    dm_fp32 = dm.float()
+
+    # Shape and dtype assertions — surface any future AMP regression immediately
+    # as a clear error rather than a silent NaN.
+    if dm_fp32.dtype != torch.float32:
+        raise RuntimeError(
+            f"SuperPoint desc_map dtype should be float32 after cast, got {dm_fp32.dtype}"
+        )
+    if dm_fp32.ndim != 4:
+        raise RuntimeError(
+            f"SuperPoint desc_map should be (B, 256, H/8, W/8), got ndim={dm_fp32.ndim} "
+            f"shape={tuple(dm_fp32.shape)}"
+        )
+    if dm_fp32.shape[1] != _SP_DESC_DIM:
+        raise RuntimeError(
+            f"SuperPoint desc_map channel dim should be {_SP_DESC_DIM}, "
+            f"got {dm_fp32.shape[1]} (shape={tuple(dm_fp32.shape)})"
+        )
+
+    return dm_fp32

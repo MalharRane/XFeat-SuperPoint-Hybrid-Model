@@ -27,14 +27,25 @@ from hybrid_model_v2.utils.checkpoint import load_checkpoint, save_checkpoint
 from hybrid_model_v2.utils.config import build_arg_parser, load_yaml_config, merge_config_with_args
 from hybrid_model_v2.utils.logging_utils import log_metrics, setup_logging, setup_tracking
 from hybrid_model_v2.utils.metrics import mean_stats, pick_model_score
-from hybrid_model_v2.utils.preflight import assert_superpoint_frozen, check_plateau_break, validate_lightglue_contract
+from hybrid_model_v2.utils.preflight import (
+    assert_superpoint_frozen,
+    check_plateau_break,
+    validate_lightglue_contract,
+)
 
 
 log = setup_logging()
 _GRID_DIVISIBILITY = 8
 
+# FIX: Number of consecutive epochs with negative sim_gap that triggers a
+# GUARDRAIL warning.  4 epochs is long enough to survive a bad initialisation
+# but short enough to surface a systematic descriptor-learning failure early.
+_NEG_SIM_GAP_GUARDRAIL_EPOCHS = 4
 
-def _add_new_trainable_params(model: nn.Module, optimizer: optim.Optimizer, lr: float, weight_decay: float) -> int:
+
+def _add_new_trainable_params(
+    model: nn.Module, optimizer: optim.Optimizer, lr: float, weight_decay: float
+) -> int:
     existing = {id(p) for g in optimizer.param_groups for p in g["params"]}
     new_params = [p for p in model.parameters() if p.requires_grad and id(p) not in existing]
     if not new_params:
@@ -60,10 +71,7 @@ def build_model_v2(cfg: Dict[str, Any], device: torch.device) -> HybridModelV2:
     )
     log.info(
         "SuperPoint weights loaded: overlap=%d/%d missing=%d unexpected=%d",
-        sp_overlap,
-        sp_total,
-        sp_miss,
-        sp_unexp,
+        sp_overlap, sp_total, sp_miss, sp_unexp,
     )
 
     xf_path = Path(str(cfg.get("xfeat_weights_path", "weights/xfeat.pt")))
@@ -87,10 +95,7 @@ def build_model_v2(cfg: Dict[str, Any], device: torch.device) -> HybridModelV2:
     )
     log.info(
         "XFeat weights loaded: overlap=%d/%d missing=%d unexpected=%d",
-        xf_overlap,
-        xf_total,
-        xf_miss,
-        xf_unexp,
+        xf_overlap, xf_total, xf_miss, xf_unexp,
     )
 
     model = HybridModelV2(
@@ -115,8 +120,11 @@ def run_preflight(
     scaler: GradScaler,
     device: torch.device,
 ) -> None:
-    if int(cfg["image_height"]) % _GRID_DIVISIBILITY != 0 or int(cfg["image_width"]) % _GRID_DIVISIBILITY != 0:
-        raise RuntimeError(f"image_height/image_width must be divisible by {_GRID_DIVISIBILITY}")
+    if int(cfg["image_height"]) % _GRID_DIVISIBILITY != 0 or \
+       int(cfg["image_width"]) % _GRID_DIVISIBILITY != 0:
+        raise RuntimeError(
+            f"image_height/image_width must be divisible by {_GRID_DIVISIBILITY}"
+        )
 
     ds = train_loader.dataset
     if hasattr(ds, "items_by_scene"):
@@ -148,8 +156,7 @@ def run_preflight(
             validate_lightglue_contract(out1, descriptor_dim=int(cfg["descriptor_dim"]))
             validate_lightglue_contract(out2, descriptor_dim=int(cfg["descriptor_dim"]))
             loss, loss_stats = loss_fn.forward_batch(
-                out1,
-                out2,
+                out1, out2,
                 homographies=homography,
                 image2_hw=(image2.shape[-2], image2.shape[-1]),
                 warp_fields=warp_field,
@@ -169,8 +176,7 @@ def run_preflight(
             out1 = model.forward_train(image1)
             out2 = model.forward_train(image2)
             loss, loss_stats = loss_fn.forward_batch(
-                out1,
-                out2,
+                out1, out2,
                 homographies=homography,
                 image2_hw=(image2.shape[-2], image2.shape[-1]),
                 warp_fields=warp_field,
@@ -224,8 +230,7 @@ def train_step(
             validate_lightglue_contract(out1, descriptor_dim=int(cfg["descriptor_dim"]))
             validate_lightglue_contract(out2, descriptor_dim=int(cfg["descriptor_dim"]))
             loss, stats = loss_fn.forward_batch(
-                out1,
-                out2,
+                out1, out2,
                 homographies=homography,
                 image2_hw=(image2.shape[-2], image2.shape[-1]),
                 warp_fields=warp_field,
@@ -244,7 +249,9 @@ def train_step(
     except RuntimeError as exc:
         if amp_enabled and is_amp_related_error(exc):
             cfg["mixed_precision"] = False
-            log.warning("AMP runtime error; switching to fp32 for rest of run. reason=%s", exc)
+            log.warning(
+                "AMP runtime error; switching to fp32 for rest of run. reason=%s", exc
+            )
             optimizer.zero_grad(set_to_none=True)
             loss, stats = _forward(False)
             loss.backward()
@@ -296,8 +303,7 @@ def validate(
         out1 = model.forward_train(image1)
         out2 = model.forward_train(image2)
         _, stats = loss_fn.forward_batch(
-            out1,
-            out2,
+            out1, out2,
             homographies=homography,
             image2_hw=(image2.shape[-2], image2.shape[-1]),
             warp_fields=warp_field,
@@ -329,7 +335,7 @@ def main() -> None:
     loss_fn = ScoreWeightedHingeRepeatabilityLoss(
         positive_margin=float(cfg.get("positive_margin", 1.0)),
         negative_margin=float(cfg.get("negative_margin", 0.2)),
-        lambda_d=float(cfg.get("lambda_d", 250.0)),
+        lambda_d=float(cfg.get("lambda_d", 25.0)),
         lambda_rep=float(cfg.get("lambda_rep", 0.5)),
         correspondence_threshold=float(cfg.get("correspondence_threshold", 6.0)),
         safe_radius=float(cfg.get("safe_radius", 8.0)),
@@ -348,7 +354,9 @@ def main() -> None:
         patience=int(cfg.get("lr_patience", 3)),
         min_lr=float(cfg.get("min_lr", 1e-6)),
     )
-    scaler = GradScaler(enabled=bool(cfg.get("mixed_precision", True) and device.type == "cuda"))
+    scaler = GradScaler(
+        enabled=bool(cfg.get("mixed_precision", True) and device.type == "cuda")
+    )
 
     tb_writer, wandb_run = setup_tracking(cfg)
 
@@ -361,18 +369,31 @@ def main() -> None:
 
     best_score = float("-inf")
     bad_epochs = 0
-    early_stop_pat = int(cfg.get("early_stop_patience", 12))
+    early_stop_pat = int(cfg.get("early_stop_patience", 5))
     global_step = 0
+
+    # FIX: sim_gap guardrail state — track consecutive epochs where sim_gap < 0.
+    _consecutive_neg_sim_gap = 0
 
     for epoch in range(start_epoch, int(cfg.get("max_epochs", 40))):
         model.train()
         assert_superpoint_frozen(model)
 
-        if cfg.get("unfreeze_at_epoch") is not None and epoch >= int(cfg["unfreeze_at_epoch"]):
-            newly_unfrozen_params = model.unfreeze_xfeat_modules(cfg.get("unfreeze_keywords", []))
-            added = _add_new_trainable_params(model, optimizer, float(cfg.get("lr", 1e-4)), float(cfg.get("weight_decay", 1e-4)))
+        if cfg.get("unfreeze_at_epoch") is not None and \
+           epoch >= int(cfg["unfreeze_at_epoch"]):
+            newly_unfrozen_params = model.unfreeze_xfeat_modules(
+                cfg.get("unfreeze_keywords", [])
+            )
+            added = _add_new_trainable_params(
+                model, optimizer,
+                float(cfg.get("lr", 1e-4)),
+                float(cfg.get("weight_decay", 1e-4)),
+            )
             if newly_unfrozen_params > 0:
-                log.info("Staged unfreeze at epoch %d: newly_unfrozen=%d optimizer_added=%d", epoch, newly_unfrozen_params, added)
+                log.info(
+                    "Staged unfreeze at epoch %d: newly_unfrozen=%d optimizer_added=%d",
+                    epoch, newly_unfrozen_params, added,
+                )
                 cfg["unfreeze_at_epoch"] = None
 
         train_stats_list: List[Dict[str, float]] = []
@@ -382,7 +403,10 @@ def main() -> None:
             global_step += 1
 
         train_stats = mean_stats(train_stats_list)
-        val_stats = validate(cfg, model, loss_fn, val_loader, device, max_batches=int(cfg.get("val_max_batches", 20)))
+        val_stats = validate(
+            cfg, model, loss_fn, val_loader, device,
+            max_batches=int(cfg.get("val_max_batches", 20)),
+        )
         val_loss = float(val_stats.get("loss", float("inf")))
         scheduler.step(val_loss)
 
@@ -395,7 +419,30 @@ def main() -> None:
             except RuntimeError as e:
                 log.warning("Milestone check: %s", e)
 
-        score = pick_model_score(str(cfg.get("model_selection_metric", "sim_gap")), val_stats, val_loss)
+        # FIX: sim_gap guardrail — warn if descriptor learning appears stuck.
+        sim_gap_val = float(val_stats.get("sim_gap", 0.0))
+        if sim_gap_val < 0.0:
+            _consecutive_neg_sim_gap += 1
+            if _consecutive_neg_sim_gap >= _NEG_SIM_GAP_GUARDRAIL_EPOCHS:
+                log.warning(
+                    "GUARDRAIL: sim_gap has been negative for %d consecutive epochs "
+                    "(current=%.4f). Descriptor learning may be broken. "
+                    "Likely causes: (1) pair co-visibility issue — check overlap "
+                    "filter; (2) lambda_d too high — consider reducing; "
+                    "(3) AMP dtype corruption — verify fp32 casts in sampler/adapters.",
+                    _consecutive_neg_sim_gap,
+                    sim_gap_val,
+                )
+        else:
+            _consecutive_neg_sim_gap = 0
+
+        # FIX: model_selection_metric is now val_loss (see config.yaml).
+        # pick_model_score returns -val_loss for the "val_loss" key so that
+        # higher score == better checkpoint, consistent with sim_gap and
+        # repeatability_mean modes.
+        score = pick_model_score(
+            str(cfg.get("model_selection_metric", "val_loss")), val_stats, val_loss
+        )
         is_best = score > best_score
         if is_best:
             best_score = score
@@ -403,19 +450,38 @@ def main() -> None:
         else:
             bad_epochs += 1
 
+        # FIX: Richer per-epoch logging — individual loss components are now
+        # printed so you can see which term is misbehaving without TensorBoard.
         log.info(
-            "Epoch %03d | train_loss=%.4f val_loss=%.4f sim_gap=%.4f repeatability=%.4f lr=%.2e %s",
+            "Epoch %03d | "
+            "train_loss=%.4f  val_loss=%.4f  "
+            "sim_gap=%.4f (pos=%.4f neg=%.4f)  "
+            "repeatability=%.4f  "
+            "hinge=%.4f  rep_loss=%.4f  "
+            "n_pos=%.0f  "
+            "lr=%.2e  %s",
             epoch,
             float(train_stats.get("loss", 0.0)),
             val_loss,
-            float(val_stats.get("sim_gap", 0.0)),
+            sim_gap_val,
+            float(val_stats.get("pos_sim_mean", 0.0)),
+            float(val_stats.get("neg_sim_mean", 0.0)),
             float(val_stats.get("repeatability_mean", 0.0)),
+            float(val_stats.get("hinge", 0.0)),
+            float(val_stats.get("rep_loss", 0.0)),
+            float(val_stats.get("n_pos", 0.0)),
             optimizer.param_groups[0]["lr"],
             "[BEST]" if is_best else "",
         )
 
-        log_metrics(metrics=train_stats, step=epoch, prefix="train", tb_writer=tb_writer, wandb_run=wandb_run)
-        log_metrics(metrics=val_stats, step=epoch, prefix="val", tb_writer=tb_writer, wandb_run=wandb_run)
+        log_metrics(
+            metrics=train_stats, step=epoch, prefix="train",
+            tb_writer=tb_writer, wandb_run=wandb_run,
+        )
+        log_metrics(
+            metrics=val_stats, step=epoch, prefix="val",
+            tb_writer=tb_writer, wandb_run=wandb_run,
+        )
 
         save_checkpoint(
             output_dir=str(cfg.get("checkpoint_dir", "hybrid_model_v2/checkpoints")),
@@ -430,7 +496,7 @@ def main() -> None:
         )
 
         if bad_epochs >= early_stop_pat:
-            log.info("Early stopping triggered after %d bad epochs", bad_epochs)
+            log.info("Early stopping triggered after %d bad epochs.", bad_epochs)
             break
 
     if tb_writer is not None:

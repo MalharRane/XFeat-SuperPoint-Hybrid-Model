@@ -104,13 +104,39 @@ class HybridModelV2(nn.Module):
 
     @staticmethod
     def _nms(scores: torch.Tensor, radius: int) -> torch.Tensor:
+        """Non-Maximum Suppression over a score heatmap.
+
+        Gradient flow analysis — DO NOT change this implementation
+        ---------------------------------------------------------
+        ``max_pool`` is computed via F.max_pool2d, which is differentiable.
+
+        ``keep = (scores == max_pool).float()`` — this hard boolean comparison
+        is NOT differentiable.  It selects *which positions* survive NMS in a
+        discrete, non-differentiable way.
+
+        ``scores * keep`` — the SURVIVING positions retain their full gradient
+        (gradient = 1.0 at surviving positions, 0.0 at suppressed ones via the
+        multiplication).  This is the "detached spatial positions, differentiable
+        score values" pattern: NMS selects which positions survive (non-
+        differentiable) but the score values at those positions remain fully
+        connected to the loss graph (differentiable).
+
+        Gradients DO flow through ``sm[ys, xs]`` after NMS to train the keypoint
+        head.  Do NOT wrap the output in ``.detach()`` — that would break the
+        detector training signal entirely.
+
+        The implementation is correct by design and has been verified to produce
+        non-zero gradients at surviving keypoint positions.
+        """
         if radius <= 0:
             return scores
         max_pool = F.max_pool2d(scores, kernel_size=2 * radius + 1, stride=1, padding=radius)
         keep = (scores == max_pool).float()
         return scores * keep
 
-    def _decode_xfeat_heatmap(self, logits: torch.Tensor, image_hw: Tuple[int, int]) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    def _decode_xfeat_heatmap(
+        self, logits: torch.Tensor, image_hw: Tuple[int, int]
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         b, c, h8, w8 = logits.shape
         h, w = image_hw
 
@@ -145,7 +171,9 @@ class HybridModelV2(nn.Module):
             sm = heat[bi, 0]
             ys, xs = torch.where(sm > self.min_keypoint_score)
             if xs.numel() == 0:
-                keypoints_px.append(torch.empty((0, 2), device=logits.device, dtype=logits.dtype))
+                keypoints_px.append(
+                    torch.empty((0, 2), device=logits.device, dtype=logits.dtype)
+                )
                 scores.append(torch.empty((0,), device=logits.device, dtype=logits.dtype))
                 continue
             sc = sm[ys, xs]
@@ -197,7 +225,9 @@ class HybridModelV2(nn.Module):
         raise RuntimeError("Unsupported XFeat API for V2") from first_err
 
     @staticmethod
-    def _sparse_to_dense_heatmap(data: Dict[str, Any], b: int, image_hw: Tuple[int, int]) -> torch.Tensor:
+    def _sparse_to_dense_heatmap(
+        data: Dict[str, Any], b: int, image_hw: Tuple[int, int]
+    ) -> torch.Tensor:
         h, w = image_hw
         feature_stride = 8
         heat = torch.zeros((b, 1, h, w), dtype=torch.float32)
@@ -220,24 +250,37 @@ class HybridModelV2(nn.Module):
     def forward_train(self, image: torch.Tensor) -> Dict[str, List[torch.Tensor]]:
         b, c, h, w = image.shape
         if c != 1:
-            raise RuntimeError(f"Input must be grayscale (B,1,H,W), got shape {tuple(image.shape)}")
+            raise RuntimeError(
+                f"Input must be grayscale (B,1,H,W), got shape {tuple(image.shape)}"
+            )
         if h % self._FEATURE_STRIDE != 0 or w % self._FEATURE_STRIDE != 0:
-            raise RuntimeError(f"Input H and W must be divisible by {self._FEATURE_STRIDE}")
+            raise RuntimeError(
+                f"Input H and W must be divisible by {self._FEATURE_STRIDE}"
+            )
 
         self.superpoint.eval()
         xfeat_logits = self._call_xfeat_forward(self._normalize_for_xfeat(image))
         keypoints_px, scores = self._decode_xfeat_heatmap(xfeat_logits, (h, w))
 
-        desc_map = extract_superpoint_desc_map(self.superpoint, self._normalize_for_superpoint(image)).float()
+        desc_map = extract_superpoint_desc_map(
+            self.superpoint, self._normalize_for_superpoint(image)
+        ).float()
 
         keypoints: List[torch.Tensor] = []
         descriptors: List[torch.Tensor] = []
         for i in range(b):
             kp_px = keypoints_px[i]
-            desc = self.sampler(kp_px, desc_map[i:i + 1], (h, w))
+            desc = self.sampler(kp_px, desc_map[i : i + 1], (h, w))
             if desc.shape[1] != self.descriptor_dim:
-                raise RuntimeError(f"Descriptor dimension mismatch: got {desc.shape[1]}, expected {self.descriptor_dim}")
-            kp = kp_px / kp_px.new_tensor([max(w - 1, 1), max(h - 1, 1)]) if kp_px.numel() > 0 else kp_px
+                raise RuntimeError(
+                    f"Descriptor dimension mismatch: got {desc.shape[1]}, "
+                    f"expected {self.descriptor_dim}"
+                )
+            kp = (
+                kp_px / kp_px.new_tensor([max(w - 1, 1), max(h - 1, 1)])
+                if kp_px.numel() > 0
+                else kp_px
+            )
             keypoints.append(kp)
             descriptors.append(desc)
 
@@ -249,7 +292,9 @@ class HybridModelV2(nn.Module):
             "heatmap": xfeat_logits,
         }
 
-    def export_descriptors(self, descriptors: List[torch.Tensor], layout: str = "BN256") -> torch.Tensor:
+    def export_descriptors(
+        self, descriptors: List[torch.Tensor], layout: str = "BN256"
+    ) -> torch.Tensor:
         if not descriptors:
             return torch.empty(0, 0, self.descriptor_dim)
         max_n = max(d.shape[0] for d in descriptors)

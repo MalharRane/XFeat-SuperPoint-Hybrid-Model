@@ -1,3 +1,61 @@
+# mode: megadepth_raw
+
+# data_root: /content/MegaDepth
+# train_scenes: ["0001", "0002"]
+# val_scenes: ["0003"]
+
+# depth_h5_key: depth
+# image_height: 480
+# image_width: 640
+
+# batch_size: 4
+# num_workers: 0
+# max_epochs: 40
+# lr: 1.0e-4
+# weight_decay: 1.0e-4
+# mixed_precision: true
+# grad_clip_norm: 10.0
+
+# num_keypoints: 1024
+# nms_radius: 4
+# min_keypoint_score: 0.01
+# descriptor_dim: 256
+
+# positive_margin: 1.0
+# negative_margin: 0.2
+# lambda_d: 250.0
+# lambda_rep: 0.5
+# correspondence_threshold: 6.0
+# safe_radius: 8.0
+# balance_pos_neg: true
+
+# augment_photometric: true
+# augment_geometric: true
+
+# unfreeze_at_epoch: null
+# unfreeze_keywords: []
+
+# model_selection_metric: sim_gap  # sim_gap | repeatability_mean
+# early_stop_patience: 12
+# lr_patience: 3
+# lr_factor: 0.5
+# min_lr: 1.0e-6
+# val_max_batches: 20
+
+# superpoint_weights_path: weights/superpoint_v1.pth
+# superpoint_weights_url: https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/superpoint_v1.pth
+# xfeat_weights_path: weights/xfeat.pt
+
+# checkpoint_dir: hybrid_model_v2/checkpoints
+# log_dir: hybrid_model_v2/runs
+# logging_backend: tensorboard  # tensorboard | wandb
+# wandb_project: xfeat-superpoint-hybrid-v2
+
+# preflight_plateau_threshold_min: 0.45
+# preflight_plateau_threshold_max: 0.55
+
+
+
 mode: megadepth_raw
 
 data_root: /content/MegaDepth
@@ -23,7 +81,12 @@ descriptor_dim: 256
 
 positive_margin: 1.0
 negative_margin: 0.2
-lambda_d: 250.0
+# FIX-1: lambda_d dropped from 250 → 25.
+# At 250 the positive-hinge term dominated the entire loss by 250×, forcing the
+# optimiser to drive all scores toward zero (which mechanically reduces loss but
+# doesn't improve descriptor separation).  25 strongly favours positive pairs
+# without crushing the negative-pair and repeatability signal.
+lambda_d: 25.0
 lambda_rep: 0.5
 correspondence_threshold: 6.0
 safe_radius: 8.0
@@ -35,8 +98,17 @@ augment_geometric: true
 unfreeze_at_epoch: null
 unfreeze_keywords: []
 
-model_selection_metric: sim_gap  # sim_gap | repeatability_mean
-early_stop_patience: 12
+# FIX-2: model_selection_metric changed from sim_gap → val_loss.
+# sim_gap was negative every epoch (–0.07 to –0.09), so pick_model_score() was
+# selecting whichever epoch had the *least-bad* sim_gap — that happened to be
+# epoch 6 (sim_gap = –0.073) even though epoch 4 had val_loss = 5.26 vs 7.49.
+# val_loss produces the correct "lower is better" ranking.
+model_selection_metric: val_loss   # sim_gap | repeatability_mean | val_loss
+
+# FIX-3: early_stop_patience reduced from 12 → 5.
+# 12 epochs of wasted compute when the signal is clearly broken is too generous.
+# 5 epochs provides enough window for an LR drop to recover before giving up.
+early_stop_patience: 5
 lr_patience: 3
 lr_factor: 0.5
 min_lr: 1.0e-6

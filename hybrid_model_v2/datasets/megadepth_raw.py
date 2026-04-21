@@ -13,10 +13,23 @@ from PIL import Image, ImageEnhance, ImageFilter
 from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms.functional as TF
 
-_ORB_MAX_MATCHES = 500  # cap candidate matches for stable/faster homography fit
+_ORB_MAX_MATCHES = 500   # cap candidate matches for stable/faster homography fit
 _PAIR_MAX_DELTA = 20
 _MIN_MATCHES_FOR_H = 30
 _MIN_INLIERS_FOR_H = 15
+_RANSAC_THRESHOLD = 2.0  # FIX: tightened from 3.0 → 2.0 px for better inlier quality
+
+# Co-visibility filter bounds (FIX: pairs outside this range are rejected).
+#
+# Pairs with overlap < _OVERLAP_MIN have little or no shared scene content —
+# no positive correspondences can be found and sim_gap becomes numerically
+# negative by construction.  Pairs with overlap > _OVERLAP_MAX are nearly
+# identical — they produce trivially easy positives and no useful negatives,
+# which skews metric-learning objectives and inflates repeatability falsely.
+# Restricting to [0.30, 0.70] keeps the pair difficulty in the "hard but
+# solvable" regime that metric learning requires.
+_OVERLAP_MIN = 0.30
+_OVERLAP_MAX = 0.70
 
 
 def _list_images(img_dir: Path) -> List[Path]:
@@ -50,6 +63,11 @@ def _build_aligned_items(img_dir: Path, depth_dir: Path) -> List[Tuple[Path, Pat
 
 
 def _estimate_homography(img1: torch.Tensor, img2: torch.Tensor) -> Optional[torch.Tensor]:
+    """Estimate a homography between two (1, H, W) grayscale tensors using ORB + RANSAC.
+
+    Returns None if fewer than _MIN_INLIERS_FOR_H inliers are found or if the
+    homography is degenerate (non-finite entries).
+    """
     a = (img1.squeeze(0).numpy() * 255.0).astype(np.uint8)
     b = (img2.squeeze(0).numpy() * 255.0).astype(np.uint8)
     orb = cv2.ORB_create(nfeatures=2000)
@@ -63,7 +81,8 @@ def _estimate_homography(img1: torch.Tensor, img2: torch.Tensor) -> Optional[tor
         return None
     pts1 = np.float32([k1[x.queryIdx].pt for x in m[:_ORB_MAX_MATCHES]]).reshape(-1, 1, 2)
     pts2 = np.float32([k2[x.trainIdx].pt for x in m[:_ORB_MAX_MATCHES]]).reshape(-1, 1, 2)
-    H, mask = cv2.findHomography(pts1, pts2, cv2.RANSAC, 3.0)
+    # FIX: RANSAC threshold tightened from 3.0 → 2.0 px for better inlier quality.
+    H, mask = cv2.findHomography(pts1, pts2, cv2.RANSAC, _RANSAC_THRESHOLD)
     if H is None or mask is None:
         return None
     if int(mask.sum()) < _MIN_INLIERS_FOR_H:
@@ -73,17 +92,47 @@ def _estimate_homography(img1: torch.Tensor, img2: torch.Tensor) -> Optional[tor
     return torch.from_numpy(H.astype(np.float32))
 
 
+def _estimate_overlap_ratio(H: torch.Tensor, image_hw: Tuple[int, int]) -> float:
+    """Estimate the fraction of img1 pixels visible in img2 after applying H.
+
+    Projects a 10×10 grid of sample points from image-1 space into image-2
+    space and returns the fraction that land within the image-2 bounds.
+
+    Args:
+        H: (3, 3) homography tensor mapping img1 coords → img2 coords.
+        image_hw: (height, width) of both images (assumed equal after resize).
+
+    Returns:
+        Overlap ratio in [0, 1].
+    """
+    h, w = image_hw
+    ys = np.linspace(0, h - 1, 10)
+    xs = np.linspace(0, w - 1, 10)
+    xx, yy = np.meshgrid(xs, ys)
+    pts = np.stack([xx.ravel(), yy.ravel(), np.ones(100)], axis=0)  # (3, 100)
+    H_np = H.numpy().astype(np.float64)
+    warped = H_np @ pts  # (3, 100)
+    z = np.abs(warped[2]).clip(1e-8)
+    xy = warped[:2] / z  # (2, 100)
+    in_bounds = (xy[0] >= 0) & (xy[0] < w) & (xy[1] >= 0) & (xy[1] < h)
+    return float(in_bounds.mean())
+
+
 def _sample_random_homography(h: int, w: int) -> torch.Tensor:
+    """Sample a random near-planar homography (kept for reference / ablations)."""
     angle = np.deg2rad(np.random.uniform(-20.0, 20.0))
     scale = 1.0 + np.random.uniform(-0.2, 0.2)
     tx = np.random.uniform(-0.05, 0.05) * w
     ty = np.random.uniform(-0.05, 0.05) * h
     ca, sa = np.cos(angle), np.sin(angle)
-    H = np.array([
-        [scale * ca, -scale * sa, tx],
-        [scale * sa, scale * ca, ty],
-        [0.0, 0.0, 1.0],
-    ], dtype=np.float32)
+    H = np.array(
+        [
+            [scale * ca, -scale * sa, tx],
+            [scale * sa, scale * ca, ty],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
     return torch.from_numpy(H)
 
 
@@ -99,6 +148,31 @@ def _build_dense_warp_from_homography(H: torch.Tensor, image_hw: Tuple[int, int]
 
 
 class MegaDepthRawDatasetV2(Dataset):
+    """MegaDepth pair dataset with co-visibility filtering and pre-computed homographies.
+
+    Key changes vs. earlier version
+    --------------------------------
+    1. Co-visibility filter (FIX for negative sim_gap):
+       Pairs are pre-filtered during ``__init__`` so that only pairs whose
+       overlap ratio lies strictly in [_OVERLAP_MIN, _OVERLAP_MAX] enter the
+       training pool.  Zero-overlap pairs produce no positive correspondences,
+       making sim_gap numerically negative by construction.  Near-identical
+       pairs are too easy and skew metric-learning objectives.
+
+    2. Pre-computed homographies:
+       The ORB homography is now computed once per pair during ``__init__``
+       (with a per-scene image cache to avoid redundant disk reads) and stored
+       in the pair tuple.  ``__getitem__`` uses the stored H directly — no ORB
+       at training time.
+
+    3. Geometric augmentation composition removed (FIX for low repeatability):
+       The 0.2-probability ``H = H_random @ H_orb`` composition is gone.
+       Composing the ORB-estimated H (already an approximation for a 3D scene)
+       with a synthetic random H further degrades correspondence quality and
+       keeps repeatability near zero.  Photometric augmentation on img2 is
+       retained — it does not break geometric consistency.
+    """
+
     def __init__(
         self,
         root: str,
@@ -133,21 +207,66 @@ class MegaDepthRawDatasetV2(Dataset):
             if len(aligned) >= 2:
                 self.items_by_scene[scene] = aligned
 
-        self.pairs: List[Tuple[str, int, int]] = []
+        # FIX: Build pairs with co-visibility filtering.
+        # Pair tuples now store the pre-computed H: (scene, i, j, H).
+        # Only pairs with _OVERLAP_MIN ≤ overlap ≤ _OVERLAP_MAX are accepted.
+        self.pairs: List[Tuple[str, int, int, torch.Tensor]] = []
+        total_candidates = 0
+        total_accepted = 0
+
         for scene, items in self.items_by_scene.items():
             n = len(items)
-            local = []
+            candidates: List[Tuple[int, int]] = []
             max_delta = min(_PAIR_MAX_DELTA, n - 1)
             for i in range(n):
                 for d in range(1, max_delta + 1):
                     j = i + d
                     if j < n:
-                        local.append((scene, i, j))
-            random.shuffle(local)
-            self.pairs.extend(local[: self.max_pairs_per_scene])
+                        candidates.append((i, j))
+            random.shuffle(candidates)
+            total_candidates += len(candidates)
+
+            # Per-scene image cache — avoids re-loading the same image for
+            # multiple candidate pairs.  Cleared after each scene to bound
+            # peak memory usage.
+            img_cache: Dict[int, torch.Tensor] = {}
+
+            accepted: List[Tuple[str, int, int, torch.Tensor]] = []
+            for i, j in candidates:
+                if len(accepted) >= self.max_pairs_per_scene:
+                    break
+
+                # Load images with per-scene cache
+                if i not in img_cache:
+                    img_cache[i] = self._load_gray(items[i][0])
+                if j not in img_cache:
+                    img_cache[j] = self._load_gray(items[j][0])
+
+                H = _estimate_homography(img_cache[i], img_cache[j])
+                if H is None:
+                    continue
+
+                overlap = _estimate_overlap_ratio(H, self.image_size)
+                if _OVERLAP_MIN <= overlap <= _OVERLAP_MAX:
+                    accepted.append((scene, i, j, H))
+
+            total_accepted += len(accepted)
+            self.pairs.extend(accepted)
+            img_cache.clear()  # free per-scene cache
 
         if not self.pairs:
-            raise RuntimeError(f"No valid scene pairs found for split={self.split}")
+            raise RuntimeError(
+                f"No valid scene pairs found for split={self.split!r} after co-visibility "
+                f"filtering (overlap range [{_OVERLAP_MIN:.2f}, {_OVERLAP_MAX:.2f}]). "
+                f"Checked {total_candidates} candidates, accepted {total_accepted}. "
+                f"Scenes available: {list(self.items_by_scene.keys())}"
+            )
+
+        print(
+            f"[MegaDepthRaw] split={self.split!r}: accepted {len(self.pairs)}/{total_candidates} "
+            f"pairs after co-visibility filter "
+            f"(overlap ∈ [{_OVERLAP_MIN:.2f}, {_OVERLAP_MAX:.2f}])"
+        )
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -186,7 +305,9 @@ class MegaDepthRawDatasetV2(Dataset):
         return out
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        scene, i, j = self.pairs[idx]
+        # FIX: Pair tuples now include the pre-computed H (computed and
+        # overlap-filtered at __init__ time).  No ORB is run here.
+        scene, i, j, H = self.pairs[idx]
         a_img_path, a_depth_path = self.items_by_scene[scene][i]
         b_img_path, b_depth_path = self.items_by_scene[scene][j]
 
@@ -195,13 +316,15 @@ class MegaDepthRawDatasetV2(Dataset):
         _, valid1 = self._load_depth_and_valid(a_depth_path)
         _, valid2 = self._load_depth_and_valid(b_depth_path)
 
-        H = _estimate_homography(img1, img2)
-        if H is None:
-            H = _sample_random_homography(self.image_size[0], self.image_size[1])
-
-        if self.augment_geometric and random.random() < 0.2:
-            H = _sample_random_homography(self.image_size[0], self.image_size[1]) @ H
-
+        # Use the pre-stored ORB homography directly.
+        # FIX: The 0.2-probability geometric augmentation composition
+        #   H = _sample_random_homography(...) @ H
+        # has been removed.  The ORB H is already an approximation for a 3D
+        # scene (a planar H is only locally valid).  Composing it with a
+        # synthetic random H further degrades correspondence quality and was
+        # the primary cause of repeatability staying near zero.
+        # Photometric augmentation on img2 is retained — it does not break
+        # geometric consistency.
         img2 = self._photo_aug(img2)
 
         warp_field = _build_dense_warp_from_homography(H, self.image_size)
@@ -259,6 +382,12 @@ def build_dataloaders_v2(cfg: Dict[str, object]) -> Tuple[DataLoader, DataLoader
 
     nw = int(cfg.get("num_workers", 0))
     bs = int(cfg.get("batch_size", 4))
-    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=nw, drop_last=True, collate_fn=collate_v2)
-    val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=nw, drop_last=True, collate_fn=collate_v2)
+    train_loader = DataLoader(
+        train_ds, batch_size=bs, shuffle=True, num_workers=nw,
+        drop_last=True, collate_fn=collate_v2,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=bs, shuffle=False, num_workers=nw,
+        drop_last=True, collate_fn=collate_v2,
+    )
     return train_loader, val_loader
