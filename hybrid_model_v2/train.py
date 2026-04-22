@@ -464,12 +464,15 @@ def main() -> None:
 
         # FIX: Richer per-epoch logging — individual loss components are now
         # printed so you can see which term is misbehaving without TensorBoard.
+        # rep_matched_score / rep_unmatched_score show whether the contrastive
+        # rep_loss is successfully separating the score distributions.
         log.info(
             "Epoch %03d | "
             "train_loss=%.4f  val_loss=%.4f  "
             "sim_gap=%.4f (pos=%.4f neg=%.4f)  "
             "repeatability=%.4f  "
             "hinge=%.4f  rep_loss=%.4f  "
+            "rep_scores matched=%.3f unmatched=%.3f  "
             "n_pos=%.0f  "
             "lr=%.2e  %s",
             epoch,
@@ -481,6 +484,8 @@ def main() -> None:
             float(val_stats.get("repeatability_mean", 0.0)),
             float(val_stats.get("hinge", 0.0)),
             float(val_stats.get("rep_loss", 0.0)),
+            float(val_stats.get("rep_matched_score", 0.0)),
+            float(val_stats.get("rep_unmatched_score", 0.0)),
             float(val_stats.get("n_pos", 0.0)),
             optimizer.param_groups[0]["lr"],
             "[BEST]" if is_best else "",

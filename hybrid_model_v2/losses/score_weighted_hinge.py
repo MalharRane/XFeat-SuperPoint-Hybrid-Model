@@ -12,11 +12,11 @@ _EPS = 1e-8
 class ScoreWeightedHingeRepeatabilityLoss(nn.Module):
     def __init__(
         self,
-        positive_margin: float = 1.0,
+        positive_margin: float = 0.5,
         negative_margin: float = 0.2,
-        lambda_d: float = 250.0,
-        lambda_rep: float = 0.5,
-        correspondence_threshold: float = 6.0,
+        lambda_d: float = 25.0,
+        lambda_rep: float = 2.0,
+        correspondence_threshold: float = 4.0,
         safe_radius: float = 8.0,
         balance_pos_neg: bool = True,
     ):
@@ -38,9 +38,13 @@ class ScoreWeightedHingeRepeatabilityLoss(nn.Module):
         return (wh[:2] / wh[2:].clamp(min=_EPS)).T
 
     def _build_correspondence_from_homography(
-        self, kp1: torch.Tensor, kp2: torch.Tensor, H: torch.Tensor, image2_hw: Tuple[int, int], depth_valid_1: Optional[torch.Tensor]
+        self,
+        kp1: torch.Tensor,
+        kp2: torch.Tensor,
+        H: torch.Tensor,
+        image2_hw: Tuple[int, int],
+        depth_valid_1: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        n = kp1.shape[0]
         warped = self._warp_kp_h(kp1, H)
         h2, w2 = image2_hw
         r = self.safe_radius
@@ -111,9 +115,13 @@ class ScoreWeightedHingeRepeatabilityLoss(nn.Module):
             return z, {"loss": 0.0, "n_pos": 0.0, "n_neg": 0.0}
 
         if warp_field is not None:
-            S = self._build_correspondence_from_warp(kp1, kp2, warp_field, warp_valid, image2_hw)
+            S = self._build_correspondence_from_warp(
+                kp1, kp2, warp_field, warp_valid, image2_hw
+            )
         else:
-            S = self._build_correspondence_from_homography(kp1, kp2, homography, image2_hw, depth_valid_1)
+            S = self._build_correspondence_from_homography(
+                kp1, kp2, homography, image2_hw, depth_valid_1
+            )
         S = S.detach()
 
         sim = d1 @ d2.T
@@ -130,28 +138,64 @@ class ScoreWeightedHingeRepeatabilityLoss(nn.Module):
         else:
             hinge = (pos + neg).mean()
 
-        has1 = (S.sum(dim=1) > 0).float()
-        has2 = (S.sum(dim=0) > 0).float()
-        rep = (
-            -((has1 * scores1.float()).sum() / has1.sum().clamp(min=1.0))
-            -((has2 * scores2.float()).sum() / has2.sum().clamp(min=1.0))
-        ) * 0.5
+        # ── Contrastive repeatability loss ─────────────────────────────────
+        # FIX: Replace one-sided rep_loss with a contrastive formulation.
+        #
+        # PROBLEM WITH PREVIOUS FORMULATION:
+        #   rep_loss = -mean(score at matched kps)
+        #
+        # This saturates in ~3 epochs: all matched kp scores → 1.0, gradient → 0.
+        # The optimizer reaches the minimum (rep=-1.0) by setting EVERY score
+        # to 1.0 indiscriminately — no discrimination between matched and
+        # unmatched positions.  After saturation, this term provides zero
+        # gradient and the detector stops learning.
+        #
+        # FIX — CONTRASTIVE FORMULATION:
+        #   rep_loss = -(mean_score_matched - mean_score_unmatched)
+        #
+        # This cannot be short-circuited by setting all scores to 1.0:
+        #   If all scores = 1.0: rep_loss = -(1.0 - 1.0) = 0.0  (BAD — no credit)
+        #   If matched=1.0, unmatched=0.0: rep_loss = -1.0        (GOOD — global min)
+        #
+        # The gradient pushes matched kp scores UP and unmatched kp scores DOWN
+        # simultaneously.  The detector must DISCRIMINATE between positions that
+        # have visual correspondences and positions that don't.  This is exactly
+        # what a keypoint detector is supposed to do.
+        #
+        # With n_pos≈90 (4px threshold) out of 1024 kps, ~934 kps are
+        # "unmatched" and now receive a gradient signal for the first time.
+        has1 = (S.sum(dim=1) > 0).float()   # 1 if kp1[i] has any match in kp2
+        has2 = (S.sum(dim=0) > 0).float()   # 1 if kp2[j] has any match in kp1
+        no_match1 = 1.0 - has1
+        no_match2 = 1.0 - has2
+
+        s1 = scores1.float()
+        s2 = scores2.float()
+
+        matched_score1   = (has1 * s1).sum() / has1.sum().clamp(min=1.0)
+        unmatched_score1 = (no_match1 * s1).sum() / no_match1.sum().clamp(min=1.0)
+        matched_score2   = (has2 * s2).sum() / has2.sum().clamp(min=1.0)
+        unmatched_score2 = (no_match2 * s2).sum() / no_match2.sum().clamp(min=1.0)
+
+        # Minimize loss ↔ maximise (matched - unmatched) score gap.
+        rep = -((matched_score1 - unmatched_score1) + (matched_score2 - unmatched_score2)) * 0.5
 
         loss = hinge + self.lambda_rep * rep
 
         with torch.no_grad():
-            n_pos = float(S.sum().item())
+            n_pos_f = float(S.sum().item())
             n_tot = float(n * m)
-            n_neg = n_tot - n_pos
-            eps = 1e-8
-            pos_sim = float((sim * S).sum().item() / (n_pos + eps))
-            neg_sim = float((sim * (1.0 - S)).sum().item() / (n_neg + eps))
+            n_neg_f = n_tot - n_pos_f
+            pos_sim = float((sim * S).sum().item() / (n_pos_f + _EPS))
+            neg_sim = float((sim * (1.0 - S)).sum().item() / (n_neg_f + _EPS))
             stats = {
                 "loss": float(loss.item()),
                 "hinge": float(hinge.item()),
                 "rep_loss": float(rep.item()),
-                "n_pos": n_pos,
-                "n_neg": n_neg,
+                "rep_matched_score": float((0.5 * (matched_score1 + matched_score2)).item()),
+                "rep_unmatched_score": float((0.5 * (unmatched_score1 + unmatched_score2)).item()),
+                "n_pos": n_pos_f,
+                "n_neg": n_neg_f,
                 "pos_sim_mean": pos_sim,
                 "neg_sim_mean": neg_sim,
                 "sim_gap": pos_sim - neg_sim,
@@ -176,8 +220,16 @@ class ScoreWeightedHingeRepeatabilityLoss(nn.Module):
         agg: Dict[str, float] = {}
 
         for i in range(b):
-            wf = warp_fields[i] if isinstance(warp_fields, list) else (warp_fields[i] if warp_fields is not None else None)
-            wv = warp_valids[i] if isinstance(warp_valids, list) else (warp_valids[i] if warp_valids is not None else None)
+            wf = (
+                warp_fields[i]
+                if isinstance(warp_fields, list)
+                else (warp_fields[i] if warp_fields is not None else None)
+            )
+            wv = (
+                warp_valids[i]
+                if isinstance(warp_valids, list)
+                else (warp_valids[i] if warp_valids is not None else None)
+            )
             dv = depth_valid_1[i, 0] if isinstance(depth_valid_1, torch.Tensor) else None
 
             li, st = self.forward_pair(
@@ -198,6 +250,6 @@ class ScoreWeightedHingeRepeatabilityLoss(nn.Module):
                 agg[k] = agg.get(k, 0.0) + float(v)
 
         mean_loss = total / max(b, 1)
-        mean_stats = {k: v / max(b, 1) for k, v in agg.items()}
-        mean_stats["loss"] = float(mean_loss.item())
-        return mean_loss, mean_stats
+        mean_stats_out = {k: v / max(b, 1) for k, v in agg.items()}
+        mean_stats_out["loss"] = float(mean_loss.item())
+        return mean_loss, mean_stats_out
