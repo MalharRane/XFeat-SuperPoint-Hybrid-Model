@@ -317,18 +317,32 @@ class MegaDepthRawDatasetV2(Dataset):
         _, valid2 = self._load_depth_and_valid(b_depth_path)
 
         # Use the pre-stored ORB homography directly.
-        # FIX: The 0.2-probability geometric augmentation composition
-        #   H = _sample_random_homography(...) @ H
-        # has been removed.  The ORB H is already an approximation for a 3D
-        # scene (a planar H is only locally valid).  Composing it with a
-        # synthetic random H further degrades correspondence quality and was
-        # the primary cause of repeatability staying near zero.
         # Photometric augmentation on img2 is retained — it does not break
         # geometric consistency.
         img2 = self._photo_aug(img2)
 
         warp_field = _build_dense_warp_from_homography(H, self.image_size)
-        warp_valid = valid1.squeeze(0).bool()
+
+        # FIX (critical): Do NOT use depth validity as warp_valid.
+        #
+        # The ORB-estimated homography is a 2-D geometric transform — it does
+        # not use depth.  Depth validity (depth > 0) tells you whether MVS
+        # reconstructed a 3-D point at that pixel; it says nothing about
+        # whether the ORB homography maps that pixel correctly.
+        #
+        # Applying the depth mask here eliminates ~97–99 % of image-1
+        # keypoints for typical MegaDepth outdoor scenes (where < 3 % of
+        # pixels have valid depth reconstructions), leaving n_pos ≈ 1.  With
+        # n_pos = 1 the single surviving "positive" is often spurious
+        # (pos_sim ≈ 0.003 < neg_sim ≈ 0.105), so sim_gap is permanently
+        # negative and no descriptor signal reaches the network.
+        #
+        # The safe_radius border check inside _build_correspondence_from_warp
+        # is the correct out-of-bounds guard for homography-based
+        # correspondences.  No additional depth mask is needed.
+        warp_valid = torch.ones(
+            self.image_size[0], self.image_size[1], dtype=torch.bool
+        )
 
         return {
             "scene": scene,

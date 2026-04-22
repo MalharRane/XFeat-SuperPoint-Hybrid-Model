@@ -8,7 +8,15 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+
+# Use the new torch.amp API (torch.cuda.amp is deprecated in PyTorch >= 2.0).
+# GradScaler and autocast now live in torch.amp and take a device_type string.
+try:
+    from torch.amp import GradScaler, autocast  # PyTorch >= 2.0
+    _AMP_NEW_API = True
+except ImportError:
+    from torch.cuda.amp import GradScaler, autocast  # PyTorch < 2.0
+    _AMP_NEW_API = False
 
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -150,7 +158,8 @@ def run_preflight(
     optimizer.zero_grad(set_to_none=True)
 
     try:
-        with autocast(enabled=amp_enabled):
+        _ac_ctx = autocast("cuda", enabled=amp_enabled) if _AMP_NEW_API else autocast(enabled=amp_enabled)
+        with _ac_ctx:
             out1 = model.forward_train(image1)
             out2 = model.forward_train(image2)
             validate_lightglue_contract(out1, descriptor_dim=int(cfg["descriptor_dim"]))
@@ -224,7 +233,8 @@ def train_step(
     amp_enabled = bool(cfg.get("mixed_precision", True) and device.type == "cuda")
 
     def _forward(use_amp: bool):
-        with autocast(enabled=use_amp):
+        _ac = autocast("cuda", enabled=use_amp) if _AMP_NEW_API else autocast(enabled=use_amp)
+        with _ac:
             out1 = model.forward_train(image1)
             out2 = model.forward_train(image2)
             validate_lightglue_contract(out1, descriptor_dim=int(cfg["descriptor_dim"]))
@@ -354,9 +364,11 @@ def main() -> None:
         patience=int(cfg.get("lr_patience", 3)),
         min_lr=float(cfg.get("min_lr", 1e-6)),
     )
-    scaler = GradScaler(
-        enabled=bool(cfg.get("mixed_precision", True) and device.type == "cuda")
-    )
+    amp_enabled = bool(cfg.get("mixed_precision", True) and device.type == "cuda")
+    if _AMP_NEW_API:
+        scaler = GradScaler("cuda", enabled=amp_enabled)
+    else:
+        scaler = GradScaler(enabled=amp_enabled)
 
     tb_writer, wandb_run = setup_tracking(cfg)
 
