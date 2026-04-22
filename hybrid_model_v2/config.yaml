@@ -21,15 +21,36 @@ nms_radius: 4
 min_keypoint_score: 0.01
 descriptor_dim: 256
 
-positive_margin: 1.0
+# positive_margin: lowered from 1.0 → 0.5.
+#
+# With frozen SuperPoint, pos_sim is bounded by what SP produces for
+# corresponding patches — typically 0.35–0.65 for genuinely matching
+# keypoints.  With mp=1.0 the positive hinge is:
+#   lambda_d * relu(1.0 - 0.19) = 25 * 0.81 = 20.25 per pair
+# This floor is IRREDUCIBLE because the optimiser cannot increase pos_sim
+# (descriptors are frozen).  The loss plateau at ~9.5 is the direct
+# consequence — the hinge can never decrease no matter what the detector
+# learns.
+#
+# With mp=0.5 the hinge becomes:
+#   25 * relu(0.5 - pos_sim).  When pos_sim reaches 0.5, hinge → 0.
+# SuperPoint can achieve pos_sim ≥ 0.5 for genuinely corresponding patches,
+# so this target is reachable and the loss will actually decrease as the
+# detector learns to find better keypoints.
+positive_margin: 0.5
+
 negative_margin: 0.2
-# FIX-1: lambda_d dropped from 250 → 25.
-# At 250 the positive-hinge term dominated the entire loss by 250×, forcing the
-# optimiser to drive all scores toward zero (which mechanically reduces loss but
-# doesn't improve descriptor separation).  25 strongly favours positive pairs
-# without crushing the negative-pair and repeatability signal.
+# lambda_d stays at 25 — the descriptor signal is still useful.
 lambda_d: 25.0
-lambda_rep: 0.5
+# lambda_rep: raised from 0.5 → 2.0.
+#
+# The rep_loss is the ONLY directly actionable signal for the XFeat kp head
+# (it drives scores up at positions that have correspondences).  At 0.5 it
+# contributed 0.5 * (-0.88) = -0.44 vs hinge of 10.1 — a 4% share of the
+# gradient.  At 2.0 it contributes 2.0 * (-0.88) = -1.76 vs new hinge of
+# ~3.9 — a 45% share.  This gives the detector the gradient weight it
+# needs to learn to predict repeatable keypoints.
+lambda_rep: 2.0
 correspondence_threshold: 6.0
 safe_radius: 8.0
 balance_pos_neg: true
